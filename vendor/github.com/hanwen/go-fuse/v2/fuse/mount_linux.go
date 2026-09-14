@@ -10,9 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"strings"
 	"syscall"
-	"unsafe"
 )
 
 func unixgramSocketpair() (l, r *os.File, err error) {
@@ -53,6 +53,13 @@ func mountDirect(mountPoint string, opts *MountOptions, ready chan<- error) (fd 
 
 	// some values we need to pass to mount - we do as fusermount does.
 	// override possible since opts.Options comes after.
+	//
+	// Only the options listed below are understood by the kernel:
+	// https://elixir.bootlin.com/linux/v6.14.2/source/fs/fuse/inode.c#L772
+	// https://elixir.bootlin.com/linux/v6.14.2/source/fs/fs_context.c#L41
+	// https://elixir.bootlin.com/linux/v6.14.2/source/fs/fs_context.c#L50
+	// Everything else will cause an EINVAL error from syscall.Mount() and
+	// a corresponding error message in the kernel logs.
 	var r = []string{
 		fmt.Sprintf("fd=%d", fd),
 		fmt.Sprintf("rootmode=%o", st.Mode&syscall.S_IFMT),
@@ -61,10 +68,33 @@ func mountDirect(mountPoint string, opts *MountOptions, ready chan<- error) (fd 
 		// match what we do with fusermount
 		fmt.Sprintf("max_read=%d", opts.MaxWrite),
 	}
-	r = append(r, opts.Options...)
+
+	// In syscall.Mount(), [no]dev/suid/exec must be
+	// passed as bits in the flags parameter, not as strings.
+	for _, o := range opts.Options {
+		switch o {
+		case "nodev":
+			flags |= syscall.MS_NODEV
+		case "dev":
+			flags &^= syscall.MS_NODEV
+		case "nosuid":
+			flags |= syscall.MS_NOSUID
+		case "suid":
+			flags &^= syscall.MS_NOSUID
+		case "noexec":
+			flags |= syscall.MS_NOEXEC
+		case "exec":
+			flags &^= syscall.MS_NOEXEC
+		default:
+			r = append(r, o)
+		}
+	}
 
 	if opts.AllowOther {
 		r = append(r, "allow_other")
+	}
+	if opts.IDMappedMount && !opts.containsOption("default_permissions") {
+		r = append(r, "default_permissions")
 	}
 
 	if opts.Debug {
@@ -203,33 +233,6 @@ func unmount(mountPoint string, opts *MountOptions) (err error) {
 	return err
 }
 
-func getConnection(local *os.File) (int, error) {
-	var data [4]byte
-	control := make([]byte, 4*256)
-
-	// n, oobn, recvflags, from, errno  - todo: error checking.
-	_, oobn, _, _,
-		err := syscall.Recvmsg(
-		int(local.Fd()), data[:], control[:], 0)
-	if err != nil {
-		return 0, err
-	}
-
-	message := *(*syscall.Cmsghdr)(unsafe.Pointer(&control[0]))
-	fd := *(*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(&control[0])) + syscall.SizeofCmsghdr))
-
-	if message.Type != 1 {
-		return 0, fmt.Errorf("getConnection: recvmsg returned wrong control type: %d", message.Type)
-	}
-	if oobn <= syscall.SizeofCmsghdr {
-		return 0, fmt.Errorf("getConnection: too short control message. Length: %d", oobn)
-	}
-	if fd < 0 {
-		return 0, fmt.Errorf("getConnection: fd < 0: %d", fd)
-	}
-	return int(fd), nil
-}
-
 // lookPathFallback - search binary in PATH and, if that fails,
 // in fallbackDir. This is useful if PATH is possible empty.
 func lookPathFallback(file string, fallbackDir string) (string, error) {
@@ -253,4 +256,24 @@ func fusermountBinary() (string, error) {
 
 func umountBinary() (string, error) {
 	return lookPathFallback("umount", "/bin")
+}
+
+func getMaxWrite() int {
+	return maxPageLimit() * syscall.Getpagesize()
+}
+
+func maxPageLimit() (lim int) {
+	lim = 256
+
+	d, err := os.ReadFile("/proc/sys/fs/fuse/max_pages_limit")
+	if err != nil {
+		return lim
+	}
+
+	newLim, err := strconv.Atoi(string(d))
+	if err != nil {
+		return lim
+	}
+
+	return newLim
 }

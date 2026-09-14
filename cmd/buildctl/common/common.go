@@ -14,55 +14,45 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/util/tracing/delegated"
 	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 	"go.opentelemetry.io/otel/trace"
 )
 
 // ResolveClient resolves a client from CLI args
-func ResolveClient(c *cli.Context) (*client.Client, error) {
-	serverName := c.GlobalString("tlsservername")
+func ResolveClient(c *cli.Command) (*client.Client, error) {
+	serverName := c.String("tlsservername")
 	if serverName == "" {
 		// guess servername as hostname of target address
-		uri, err := url.Parse(c.GlobalString("addr"))
+		uri, err := url.Parse(c.String("addr"))
 		if err != nil {
 			return nil, err
 		}
 		serverName = uri.Hostname()
 	}
 
-	var caCert string
-	var cert string
-	var key string
+	var (
+		caCert string
+		cert   string
+		key    string
+		err    error
+	)
 
-	tlsDir := c.GlobalString("tlsdir")
+	tlsDir := c.String("tlsdir")
 
 	if tlsDir != "" {
-		// Look for ca.pem and, if it exists, set caCert to that
-		// Look for cert.pem and, if it exists, set key to that
-		// Look for key.pem and, if it exists, set tlsDir to that
-		for _, v := range [3]string{"ca.pem", "cert.pem", "key.pem"} {
-			file := filepath.Join(tlsDir, v)
-			if _, err := os.Stat(file); err == nil {
-				switch v {
-				case "ca.pem":
-					caCert = file
-				case "cert.pem":
-					cert = file
-				case "key.pem":
-					key = file
-				}
-			} else {
-				return nil, err
-			}
-		}
-
-		if c.GlobalString("tlscacert") != "" || c.GlobalString("tlscert") != "" || c.GlobalString("tlskey") != "" {
+		// Fail straight away if TLS was specified both ways
+		if c.String("tlscacert") != "" || c.String("tlscert") != "" || c.String("tlskey") != "" {
 			return nil, errors.New("cannot specify tlsdir and tlscacert/tlscert/tlskey at the same time")
 		}
+
+		caCert, cert, key, err = resolveTLSFilesFromDir(tlsDir)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		caCert = c.GlobalString("tlscacert")
-		cert = c.GlobalString("tlscert")
-		key = c.GlobalString("tlskey")
+		caCert = c.String("tlscacert")
+		cert = c.String("tlscert")
+		key = c.String("tlskey")
 	}
 
 	ctx := CommandContext(c)
@@ -81,20 +71,20 @@ func ResolveClient(c *cli.Context) (*client.Client, error) {
 		opts = append(opts, client.WithCredentials(cert, key))
 	}
 
-	timeout := time.Duration(c.GlobalInt("timeout"))
+	timeout := time.Duration(c.Int("timeout")) * time.Second
 	if timeout > 0 {
 		ctx2, cancel := context.WithCancelCause(ctx)
-		ctx2, _ = context.WithTimeoutCause(ctx2, timeout*time.Second, errors.WithStack(context.DeadlineExceeded))
+		ctx2, _ = context.WithTimeoutCause(ctx2, timeout, errors.WithStack(context.DeadlineExceeded)) //nolint:govet
 		ctx = ctx2
-		defer cancel(errors.WithStack(context.Canceled))
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 	}
 
-	cl, err := client.New(ctx, c.GlobalString("addr"), opts...)
+	cl, err := client.New(ctx, c.String("addr"), opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	wait := c.GlobalBool("wait")
+	wait := c.Bool("wait")
 	if wait {
 		if err := cl.Wait(ctx); err != nil {
 			return nil, err
@@ -114,7 +104,7 @@ func ParseTemplate(format string) (*template.Template, error) {
 	}
 	// funcs is from https://github.com/docker/cli/blob/v20.10.12/templates/templates.go#L12-L20 (Apache License 2.0)
 	funcs := template.FuncMap{
-		"json": func(v interface{}) string {
+		"json": func(v any) string {
 			buf := &bytes.Buffer{}
 			enc := json.NewEncoder(buf)
 			enc.SetEscapeHTML(false)
@@ -124,4 +114,30 @@ func ParseTemplate(format string) (*template.Template, error) {
 		},
 	}
 	return template.New("").Funcs(funcs).Parse(format)
+}
+
+// resolveTLSFilesFromDir scans a TLS directory for known cert/key filenames.
+func resolveTLSFilesFromDir(tlsDir string) (caCert, cert, key string, err error) {
+	oneOf := func(either, or string) (string, error) {
+		for _, name := range []string{either, or} {
+			fpath := filepath.Join(tlsDir, name)
+			if _, err := os.Stat(fpath); err == nil {
+				return fpath, nil
+			} else if !os.IsNotExist(err) {
+				return "", err
+			}
+		}
+		return "", errors.Errorf("directory did not contain one of the needed files: %s or %s", either, or)
+	}
+
+	if caCert, err = oneOf("ca.pem", "ca.crt"); err != nil {
+		return "", "", "", err
+	}
+	if cert, err = oneOf("cert.pem", "tls.crt"); err != nil {
+		return "", "", "", err
+	}
+	if key, err = oneOf("key.pem", "tls.key"); err != nil {
+		return "", "", "", err
+	}
+	return caCert, cert, key, nil
 }

@@ -1,6 +1,7 @@
 ---
 title: WorkdirRelativePath
-description: Relative workdir without an absolute workdir declared within the build can have unexpected results if the base image changes
+description: >-
+  Relative workdir without an absolute workdir declared within the build can have unexpected results if the base image changes
 aliases:
   - /go/dockerfile/rule/workdir-relative-path/
 ---
@@ -26,6 +27,12 @@ The rationale for this rule is that using a relative working directory for base
 image built externally is prone to breaking, since working directory may change
 upstream without warning, resulting in a completely different directory
 hierarchy for your build.
+
+> [!NOTE]
+>
+> `WORKDIR` does not perform shell expansion. Paths beginning with `~` or
+> `~username` are treated as literal directory names and are not resolved to a
+> user's home directory.
 
 ## Examples
 

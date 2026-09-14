@@ -7,8 +7,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/reexec"
+	"github.com/moby/sys/reexec"
 )
 
 const (
@@ -31,9 +30,10 @@ func userInfoMain() {
 		os.Exit(3)
 	}
 
-	ident := idtools.Identity{
-		SID: sid.String(),
+	var ident struct {
+		SID string
 	}
+	ident.SID = sid.String()
 
 	asJSON, err := json.Marshal(ident)
 	if err != nil {

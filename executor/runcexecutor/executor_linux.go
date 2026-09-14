@@ -1,14 +1,19 @@
 package runcexecutor
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/containerd/console"
 	runc "github.com/containerd/go-runc"
 	"github.com/moby/buildkit/executor"
+	gatewayapi "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/sys/signal"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -78,7 +83,34 @@ func (w *runcExecutor) callWithIO(ctx context.Context, process executor.ProcessI
 	})
 
 	if !process.Meta.Tty {
-		return call(ctx, startedCh, &forwardIO{stdin: process.Stdin, stdout: process.Stdout, stderr: process.Stderr}, killer.pidfile)
+		runcIO := &forwardIO{stdout: process.Stdout, stderr: process.Stderr}
+		if process.Stdin != nil {
+			// Forward stdin through an os.Pipe rather than handing the
+			// caller's io.ReadCloser to runc directly. When cmd.Stdin is
+			// an *os.File, exec.Cmd dup2s it into the child and cmd.Wait
+			// returns as soon as the runc subprocess exits. Otherwise
+			// exec.Cmd spawns an internal goroutine that blocks on the
+			// caller's Reader and prevents cmd.Wait from returning after
+			// the in-container process is killed. Stdin is closed in a
+			// defer after call() returns, matching the tty path and the
+			// natural-exit cleanup.
+			pr, pw, err := os.Pipe()
+			if err != nil {
+				return errors.Wrap(err, "failed to create stdin pipe")
+			}
+			runcIO.stdin = pr
+			defer pr.Close()
+			defer process.Stdin.Close()
+			eg.Go(func() error {
+				defer pw.Close()
+				_, err := io.Copy(pw, process.Stdin)
+				if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) {
+					return nil
+				}
+				return err
+			})
+		}
+		return call(ctx, startedCh, runcIO, killer.pidfile)
 	}
 
 	ptm, ptsName, err := console.NewPty()
@@ -124,7 +156,7 @@ func (w *runcExecutor) callWithIO(ctx context.Context, process executor.ProcessI
 			if errors.As(err, &ptmClosedError) {
 				if ptmClosedError.Op == "read" &&
 					ptmClosedError.Path == "/dev/ptmx" &&
-					ptmClosedError.Err == syscall.EIO {
+					errors.Is(ptmClosedError.Err, syscall.EIO) {
 					return nil
 				}
 			}
@@ -171,4 +203,45 @@ func (w *runcExecutor) callWithIO(ctx context.Context, process executor.ProcessI
 	}
 
 	return call(ctx, startedCh, runcIO, killer.pidfile)
+}
+
+func detectOOM(ctx context.Context, ns string, gwErr *gatewayapi.ExitError) {
+	const defaultCgroupMountpoint = "/sys/fs/cgroup"
+
+	if ns == "" {
+		return
+	}
+
+	count, err := readMemoryEvent(filepath.Join(defaultCgroupMountpoint, ns), "oom_kill")
+	if err != nil {
+		bklog.G(ctx).WithError(err).Warn("failed to read oom_kill event")
+		return
+	}
+	if count > 0 {
+		gwErr.Err = syscall.ENOMEM
+	}
+}
+
+func readMemoryEvent(fp string, event string) (uint64, error) {
+	f, err := os.Open(filepath.Join(fp, "memory.events"))
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		parts := strings.Fields(s.Text())
+		if len(parts) != 2 {
+			continue
+		}
+		if parts[0] != event {
+			continue
+		}
+		v, err := strconv.ParseUint(parts[1], 10, 64)
+		if err == nil {
+			return v, nil
+		}
+	}
+	return 0, s.Err()
 }

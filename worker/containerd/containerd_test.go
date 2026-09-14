@@ -1,10 +1,8 @@
 //go:build !windows
-// +build !windows
 
 package containerd
 
 import (
-	"context"
 	"testing"
 
 	"github.com/moby/buildkit/util/network/netproviders"
@@ -14,6 +12,11 @@ import (
 	"github.com/moby/buildkit/worker/tests"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMain(m *testing.M) {
+	defer tests.RunMirror()()
+	m.Run()
+}
 
 func init() {
 	workers.InitContainerdWorker()
@@ -57,7 +60,7 @@ func testContainerdWorkerExec(t *testing.T, sb integration.Sandbox) {
 		t.Skip("requires root")
 	}
 	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExec(t, w)
@@ -68,7 +71,7 @@ func testContainerdWorkerExecFailures(t *testing.T, sb integration.Sandbox) {
 		t.Skip("requires root")
 	}
 	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExecFailures(t, w)
@@ -79,7 +82,7 @@ func testContainerdWorkerCancel(t *testing.T, sb integration.Sandbox) {
 		t.Skip("requires root")
 	}
 	workerOpt := newWorkerOpt(t, sb.ContainerdAddress())
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerCancel(t, w)

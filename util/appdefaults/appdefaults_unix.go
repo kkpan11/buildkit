@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package appdefaults
 
@@ -10,7 +9,6 @@ import (
 )
 
 const (
-	Address              = "unix:///run/buildkit/buildkitd.sock"
 	Root                 = "/var/lib/buildkit"
 	ConfigDir            = "/etc/buildkit"
 	DefaultCNIBinDir     = "/opt/cni/bin"
@@ -19,6 +17,7 @@ const (
 
 var (
 	UserCNIConfigPath = filepath.Join(UserConfigDir(), "cni.json")
+	CDISpecDirs       = []string{"/etc/cdi", "/var/run/cdi", "/etc/buildkit/cdi"}
 )
 
 // UserAddress typically returns /run/user/$UID/buildkit/buildkitd.sock
@@ -38,11 +37,15 @@ func EnsureUserAddressDir() error {
 	xdgRuntimeDir := os.Getenv("XDG_RUNTIME_DIR")
 	if xdgRuntimeDir != "" {
 		dirs := strings.Split(xdgRuntimeDir, ":")
-		dir := filepath.Join(dirs[0], "buildkit")
-		if err := os.MkdirAll(dir, 0700); err != nil {
+		root, err := os.OpenRoot(dirs[0])
+		if err != nil {
 			return err
 		}
-		return os.Chmod(dir, 0700|os.ModeSticky)
+		defer root.Close()
+		if err := root.MkdirAll("buildkit", 0700); err != nil {
+			return err
+		}
+		return root.Chmod("buildkit", 0700|os.ModeSticky)
 	}
 	return nil
 }
@@ -82,5 +85,5 @@ func TraceSocketPath(inUserNS bool) string {
 			return filepath.Join(dirs[0], "buildkit", "otel-grpc.sock")
 		}
 	}
-	return "/run/buildkit/otel-grpc.sock"
+	return traceSocketPath
 }

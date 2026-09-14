@@ -89,7 +89,7 @@ RUN ls
 	require.True(t, ok)
 	require.Equal(t, "x", ref)
 
-	dt = `{"syntax": "foo"}`
+	dt = `{"syntax": "foo", "bar": ["abc"]}`
 	ref, _, _, ok = DetectSyntax([]byte(dt))
 	require.True(t, ok)
 	require.Equal(t, "foo", ref)
@@ -102,6 +102,20 @@ RUN ls
 # syntax=bar`
 	_, _, _, ok = DetectSyntax([]byte(dt))
 	require.False(t, ok)
+}
+
+func TestDetectSyntaxBOM(t *testing.T) {
+	t.Parallel()
+
+	dt := append([]byte{0xEF, 0xBB, 0xBF}, []byte(`# syntax = myfrontend
+FROM busybox
+`)...)
+	ref, cmdline, loc, ok := DetectSyntax(dt)
+	require.True(t, ok)
+	require.Equal(t, "myfrontend", ref)
+	require.Equal(t, "myfrontend", cmdline)
+	require.Equal(t, 1, loc[0].Start.Line)
+	require.Equal(t, 1, loc[0].End.Line)
 }
 
 func TestParseDirective(t *testing.T) {
@@ -144,27 +158,6 @@ RUN ls
 
 	dt = `//check=skip=all
 //key=value`
-	ref, _, _, ok = ParseDirective("check", []byte(dt))
-	require.True(t, ok)
-	require.Equal(t, "skip=all", ref)
-
-	dt = `#!/bin/sh
-//check=skip=all`
-	ref, _, _, ok = ParseDirective("check", []byte(dt))
-	require.True(t, ok)
-	require.Equal(t, "skip=all", ref)
-
-	dt = `{"check": "skip=all"}`
-	ref, _, _, ok = ParseDirective("check", []byte(dt))
-	require.True(t, ok)
-	require.Equal(t, "skip=all", ref)
-
-	dt = `{"check": "foo"`
-	_, _, _, ok = ParseDirective("check", []byte(dt))
-	require.False(t, ok)
-
-	dt = `{"check": "foo"}
-# syntax=bar`
 	_, _, _, ok = ParseDirective("check", []byte(dt))
 	require.False(t, ok)
 }

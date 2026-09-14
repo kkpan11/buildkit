@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
@@ -15,7 +15,7 @@ import (
 
 func TestFetcher(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b0 := NewBuffer()
 
@@ -50,7 +50,7 @@ func TestFetcher(t *testing.T) {
 
 func TestSlowFetch(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	f := &dummySlowFetcher{}
 	p := FromFetcher(f)

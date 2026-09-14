@@ -153,7 +153,6 @@ func TestParseOptInterval(t *testing.T) {
 
 func TestNilLinter(t *testing.T) {
 	for cmd := range command.Commands {
-		cmd := cmd
 		t.Run(cmd, func(t *testing.T) {
 			t.Parallel()
 
@@ -194,18 +193,18 @@ ARG bar baz=123
 	stages, meta, err := Parse(ast.AST, nil)
 	require.NoError(t, err)
 
-	require.Equal(t, "defines first stage", stages[0].Comment)
+	require.Equal(t, "defines first stage", stages[0].DocComment)
 	require.Equal(t, "foo", meta[0].Args[0].Key)
-	require.Equal(t, "sets foo", meta[0].Args[0].Comment)
+	require.Equal(t, "sets foo", meta[0].Args[0].DocComment)
 
 	st := stages[0]
 
 	require.Equal(t, "foo", st.Commands[0].(*ArgCommand).Args[0].Key)
-	require.Equal(t, "", st.Commands[0].(*ArgCommand).Args[0].Comment)
+	require.Equal(t, "", st.Commands[0].(*ArgCommand).Args[0].DocComment)
 	require.Equal(t, "bar", st.Commands[1].(*ArgCommand).Args[0].Key)
-	require.Equal(t, "defines bar", st.Commands[1].(*ArgCommand).Args[0].Comment)
+	require.Equal(t, "defines bar", st.Commands[1].(*ArgCommand).Args[0].DocComment)
 	require.Equal(t, "baz", st.Commands[1].(*ArgCommand).Args[1].Key)
-	require.Equal(t, "is something else", st.Commands[1].(*ArgCommand).Args[1].Comment)
+	require.Equal(t, "is something else", st.Commands[1].(*ArgCommand).Args[1].DocComment)
 }
 
 func TestErrorCases(t *testing.T) {
@@ -229,7 +228,7 @@ func TestErrorCases(t *testing.T) {
 		{
 			name:          "MAINTAINER unknown flag",
 			dockerfile:    "MAINTAINER --boo joe@example.com",
-			expectedError: "unknown flag: boo",
+			expectedError: "unknown flag: --boo",
 		},
 		{
 			name:          "Chaining ONBUILD",
@@ -276,7 +275,7 @@ func TestRunCmdFlagsUsed(t *testing.T) {
 func BenchmarkParseBuildStageName(b *testing.B) {
 	b.ReportAllocs()
 	stageNames := []string{"STAGE_NAME", "StageName", "St4g3N4m3"}
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		for _, s := range stageNames {
 			_, _ = parseBuildStageName([]string{"foo", "as", s})
 		}

@@ -1,11 +1,10 @@
 package content
 
 import (
-	"context"
 	"testing"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/testutil"
 	digest "github.com/opencontainers/go-digest"
@@ -16,7 +15,7 @@ import (
 )
 
 func TestContentAttachable(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	t.Parallel()
 	ids := []string{"store-id-0", "store-id-1"}
 	attachableStores := make(map[string]content.Store)

@@ -9,18 +9,20 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/oci"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/mitchellh/hashstructure/v2"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/gohugoio/hashstructure"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/util/network"
 	rootlessmountopts "github.com/moby/buildkit/util/rootless/mountopts"
-	traceexec "github.com/moby/buildkit/util/tracing/exec"
-	"github.com/moby/sys/user/userns"
+	"github.com/moby/buildkit/util/system"
+	"github.com/moby/buildkit/util/tracing/childprocess"
+	"github.com/moby/sys/user"
+	"github.com/moby/sys/userns"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
@@ -44,6 +46,29 @@ var tracingEnvVars = []string{
 	"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc",
 }
 
+// envName returns the variable name of a "NAME=VALUE" environment entry.
+func envName(env string) string {
+	name, _, _ := strings.Cut(env, "=")
+	return name
+}
+
+// appendMissingTracingEnv appends the OpenTelemetry trace-exporter variables
+// that the build has not already set. This lets a build override or opt out of
+// them (for example with `--opt env.OTEL_TRACES_EXPORTER=none`) instead of
+// BuildKit unconditionally forcing its own values.
+func appendMissingTracingEnv(env []string) []string {
+	existing := make(map[string]struct{}, len(env))
+	for _, e := range env {
+		existing[envName(e)] = struct{}{}
+	}
+	for _, e := range tracingEnvVars {
+		if _, ok := existing[envName(e)]; !ok {
+			env = append(env, e)
+		}
+	}
+	return env
+}
+
 func (pm ProcessMode) String() string {
 	switch pm {
 	case ProcessSandbox:
@@ -59,7 +84,7 @@ func (pm ProcessMode) String() string {
 
 // GenerateSpec generates spec using containerd functionality.
 // opts are ignored for s.Process, s.Hostname, and s.Mounts .
-func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mount, id, resolvConf, hostsFile string, namespace network.Namespace, cgroupParent string, processMode ProcessMode, idmap *idtools.IdentityMapping, apparmorProfile string, selinuxB bool, tracingSocket string, opts ...oci.SpecOpts) (*specs.Spec, func(), error) {
+func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mount, id, resolvConf, hostsFile string, namespace network.Namespace, cgroupParent string, processMode ProcessMode, idmap *user.IdentityMapping, apparmorProfile string, selinuxB bool, tracingSocket string, cdiManager *cdidevices.Manager, opts ...oci.SpecOpts) (*specs.Spec, func(), error) {
 	c := &containers.Container{
 		ID: id,
 	}
@@ -84,11 +109,7 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 		ctx = namespaces.WithNamespace(ctx, "buildkit")
 	}
 
-	if mountOpts, err := generateMountOpts(resolvConf, hostsFile); err == nil {
-		opts = append(opts, mountOpts...)
-	} else {
-		return nil, nil, err
-	}
+	opts = append(opts, generateMountOpts(resolvConf, hostsFile)...)
 
 	if securityOpts, err := generateSecurityOpts(meta.SecurityMode, apparmorProfile, selinuxB); err == nil {
 		opts = append(opts, securityOpts...)
@@ -114,6 +135,12 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 		return nil, nil, err
 	}
 
+	if linuxResOpts, err := generateLinuxResourceOpts(meta.LinuxResources); err == nil {
+		opts = append(opts, linuxResOpts...)
+	} else {
+		return nil, nil, err
+	}
+
 	hostname := defaultHostname
 	if meta.Hostname != "" {
 		hostname = meta.Hostname
@@ -121,8 +148,10 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 
 	if tracingSocket != "" {
 		// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/protocol/exporter.md
-		meta.Env = append(meta.Env, tracingEnvVars...)
-		meta.Env = append(meta.Env, traceexec.Environ(ctx)...)
+		// Only inject the trace-exporter variables the build has not already set,
+		// so it can override or opt out of them (e.g. `--opt env.OTEL_TRACES_EXPORTER=none`).
+		meta.Env = appendMissingTracingEnv(meta.Env)
+		meta.Env = append(meta.Env, childprocess.Environ(ctx)...)
 	}
 
 	opts = append(opts,
@@ -133,9 +162,17 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 		oci.WithHostname(hostname),
 	)
 
+	if cdiManager != nil {
+		if cdiOpts, err := generateCDIOpts(cdiManager, meta.CDIDevices); err == nil {
+			opts = append(opts, cdiOpts...)
+		} else {
+			return nil, nil, err
+		}
+	}
+
 	s, err := oci.GenerateSpec(ctx, nil, c, opts...)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
 
 	if cgroupV2NamespaceSupported() {
@@ -151,7 +188,7 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 
 	// set the networking information on the spec
 	if err := namespace.Set(s); err != nil {
-		return nil, nil, err
+		return nil, nil, errors.WithStack(err)
 	}
 
 	sm := &submounts{}
@@ -196,11 +233,17 @@ func GenerateSpec(ctx context.Context, meta executor.Meta, mounts []executor.Mou
 			mount, err = sm.subMount(mount, m.Selector)
 			if err != nil {
 				releaseAll()
+				var os *os.PathError
+				if errors.As(err, &os) {
+					if strings.HasSuffix(os.Path, m.Selector) {
+						os.Path = m.Selector
+					}
+				}
 				return nil, nil, err
 			}
 			s.Mounts = append(s.Mounts, specs.Mount{
-				Destination: m.Dest,
-				Type:        mount.Type,
+				Destination: system.GetAbsolutePath(m.Dest),
+				Type:        normalizeMountType(mount.Type),
 				Source:      mount.Source,
 				Options:     mount.Options,
 			})
@@ -240,15 +283,16 @@ type submounts struct {
 }
 
 func (s *submounts) subMount(m mount.Mount, subPath string) (mount.Mount, error) {
-	if path.Join("/", subPath) == "/" {
+	// for Windows, always go through the sub-mounting process
+	if path.Join("/", subPath) == "/" && runtime.GOOS != "windows" {
 		return m, nil
 	}
 	if s.m == nil {
 		s.m = map[uint64]mountRef{}
 	}
-	h, err := hashstructure.Hash(m, hashstructure.FormatV2, nil)
+	h, err := hashstructure.Hash(m, nil)
 	if err != nil {
-		return mount.Mount{}, err
+		return mount.Mount{}, errors.WithStack(err)
 	}
 	if mr, ok := s.m[h]; ok {
 		if sm, ok := mr.subRefs[subPath]; ok {

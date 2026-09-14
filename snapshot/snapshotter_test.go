@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package snapshot
 
@@ -12,14 +11,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/leases"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/native"
-	"github.com/containerd/containerd/snapshots/overlay"
+	"github.com/containerd/containerd/v2/core/leases"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/containerd/v2/plugins/snapshots/native"
+	"github.com/containerd/containerd/v2/plugins/snapshots/overlay"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/leaseutil"
@@ -76,7 +75,7 @@ func newSnapshotter(ctx context.Context, t *testing.T, snapshotterName string) (
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		snapshotterName: ctdSnapshotter,
 	})
-	if err := mdb.Init(context.TODO()); err != nil {
+	if err := mdb.Init(t.Context()); err != nil {
 		return nil, nil, err
 	}
 
@@ -107,14 +106,13 @@ func newSnapshotter(ctx context.Context, t *testing.T, snapshotterName string) (
 
 func TestMerge(t *testing.T) {
 	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
-		snName := snName
 		t.Run(snName, func(t *testing.T) {
 			t.Parallel()
 			if snName == "overlayfs" {
 				requireRoot(t)
 			}
 
-			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
+			ctx, sn, err := newSnapshotter(t.Context(), t, snName)
 			require.NoError(t, err)
 
 			ts := time.Unix(0, 0)
@@ -311,14 +309,13 @@ func TestMerge(t *testing.T) {
 
 func TestHardlinks(t *testing.T) {
 	for _, snName := range []string{"overlayfs", "native"} {
-		snName := snName
 		t.Run(snName, func(t *testing.T) {
 			t.Parallel()
 			if snName == "overlayfs" {
 				requireRoot(t)
 			}
 
-			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
+			ctx, sn, err := newSnapshotter(t.Context(), t, snName)
 			require.NoError(t, err)
 
 			base1Snap := committedKey(ctx, t, sn, identity.NewID(), "",
@@ -354,12 +351,12 @@ func TestHardlinks(t *testing.T) {
 			)
 			stat1 = statPath(ctx, t, sn, childSnap.Name, "1")
 			require.EqualValues(t, 1, stat1.Nlink)
-			require.NotEqualValues(t, stat1Ino, stat1.Ino)
+			require.NotEqual(t, stat1Ino, stat1.Ino)
 			stat2 = statPath(ctx, t, sn, childSnap.Name, "2")
 			require.EqualValues(t, 1, stat2.Nlink)
-			require.NotEqualValues(t, stat2Ino, stat2.Ino)
+			require.NotEqual(t, stat2Ino, stat2.Ino)
 
-			// verify the original files and the files inthe merge are unchanged
+			// verify the original files and the files in the merge are unchanged
 			requireContents(ctx, t, sn, base1Snap.Name,
 				fstest.CreateFile("1", []byte("1"), 0600),
 			)
@@ -377,11 +374,10 @@ func TestHardlinks(t *testing.T) {
 func TestMergeFileCapabilities(t *testing.T) {
 	requireRoot(t)
 	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
-		snName := snName
 		t.Run(snName, func(t *testing.T) {
 			t.Parallel()
 
-			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
+			ctx, sn, err := newSnapshotter(t.Context(), t, snName)
 			require.NoError(t, err)
 
 			setCaps := "cap_net_bind_service=+ep"
@@ -411,14 +407,13 @@ func TestMergeFileCapabilities(t *testing.T) {
 
 func TestUsage(t *testing.T) {
 	for _, snName := range []string{"overlayfs", "native", "native-nohardlink"} {
-		snName := snName
 		t.Run(snName, func(t *testing.T) {
 			t.Parallel()
 			if snName == "overlayfs" {
 				requireRoot(t)
 			}
 
-			ctx, sn, err := newSnapshotter(context.Background(), t, snName)
+			ctx, sn, err := newSnapshotter(t.Context(), t, snName)
 			require.NoError(t, err)
 
 			const direntByteSize = 4096

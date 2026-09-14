@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -15,11 +17,11 @@ import (
 
 func TestProgress(t *testing.T) {
 	t.Parallel()
-	s, err := calc(context.TODO(), 4, "calc")
+	s, err := calc(t.Context(), 4, "calc")
 	require.NoError(t, err)
 	assert.Equal(t, 10, s)
 
-	eg, ctx := errgroup.WithContext(context.Background())
+	eg, ctx := errgroup.WithContext(t.Context())
 
 	pr, ctx, cancelProgress := NewContext(ctx)
 	var trace trace
@@ -48,7 +50,7 @@ func TestProgress(t *testing.T) {
 
 func TestProgressNested(t *testing.T) {
 	t.Parallel()
-	eg, ctx := errgroup.WithContext(context.Background())
+	eg, ctx := errgroup.WithContext(t.Context())
 	pr, ctx, cancelProgress := NewContext(ctx)
 	var trace trace
 	eg.Go(func() error {
@@ -63,8 +65,19 @@ func TestProgressNested(t *testing.T) {
 	err = eg.Wait()
 	require.NoError(t, err)
 
-	assert.Greater(t, len(trace.items), 9) // usually 14
-	assert.LessOrEqual(t, len(trace.items), 15)
+	last := map[string]*Progress{}
+	for _, p := range trace.items {
+		prev, ok := last[p.ID]
+		if !ok || p.Timestamp.After(prev.Timestamp) {
+			last[p.ID] = p
+		}
+	}
+
+	require.ElementsMatch(t, []string{"reduce", "synccalc", "calc-0", "calc-1"}, slices.Collect(maps.Keys(last)))
+	assert.Equal(t, Status{Action: "starting"}, last["reduce"].Sys)
+	for _, id := range []string{"synccalc", "calc-0", "calc-1"} {
+		assert.Equal(t, Status{Action: "done", Current: 3, Total: 3}, last[id].Sys)
+	}
 }
 
 func calc(ctx context.Context, total int, name string) (int, error) {
@@ -104,7 +117,7 @@ func reduceCalc(ctx context.Context, total int) (int, error) {
 		return 0, err
 	}
 	// parallel steps
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		func(i int) {
 			eg.Go(func() error {
 				_, err := calc(ctx, total, fmt.Sprintf("calc-%d", i))
@@ -126,7 +139,7 @@ func saveProgress(ctx context.Context, pr Reader, t *trace) error {
 	for {
 		p, err := pr.Read(ctx)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err

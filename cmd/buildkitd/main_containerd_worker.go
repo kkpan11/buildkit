@@ -1,6 +1,3 @@
-//go:build linux || windows || freebsd
-// +build linux windows freebsd
-
 package main
 
 import (
@@ -12,19 +9,20 @@ import (
 	"strings"
 	"time"
 
-	ctd "github.com/containerd/containerd"
-	"github.com/containerd/containerd/defaults"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/disk"
 	"github.com/moby/buildkit/util/network/cniprovider"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/worker"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/containerd"
-	"github.com/moby/sys/user/userns"
-	"github.com/pelletier/go-toml"
+	"github.com/moby/sys/userns"
+	"github.com/pelletier/go-toml/v2"
 	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -43,7 +41,7 @@ func init() {
 	}
 
 	if defaultConf.Workers.Containerd.Address == "" {
-		defaultConf.Workers.Containerd.Address = defaultContainerdAddress
+		defaultConf.Workers.Containerd.Address = defaults.DefaultAddress
 	}
 
 	if defaultConf.Workers.Containerd.Namespace == "" {
@@ -60,107 +58,117 @@ func init() {
 	}
 
 	flags := []cli.Flag{
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-worker",
 			Usage: "enable containerd workers (true/false/auto)",
 			Value: enabledValue(defaultConf.Workers.Containerd.Enabled),
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-worker-addr",
 			Usage: "containerd socket",
 			Value: defaultConf.Workers.Containerd.Address,
 		},
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:  "containerd-worker-labels",
 			Usage: "user-specific annotation labels (com.example.foo=bar)",
 		},
 		// TODO: containerd-worker-platform should be replaced by ability
 		// to set these from containerd configuration
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:   "containerd-worker-platform",
 			Usage:  "override supported platforms for worker",
 			Hidden: true,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:   "containerd-worker-namespace",
 			Usage:  "override containerd namespace",
 			Value:  defaultConf.Workers.Containerd.Namespace,
 			Hidden: true,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:   "containerd-worker-runtime",
 			Usage:  "override containerd runtime",
 			Value:  defaultConf.Workers.Containerd.Runtime.Name,
 			Hidden: true,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-worker-net",
 			Usage: "worker network type (auto, bridge, cni or host)",
-			Value: defaultConf.Workers.Containerd.NetworkConfig.Mode,
+			Value: defaultConf.Workers.Containerd.Mode,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-cni-config-path",
 			Usage: "path of cni config file",
-			Value: defaultConf.Workers.Containerd.NetworkConfig.CNIConfigPath,
+			Value: defaultConf.Workers.Containerd.CNIConfigPath,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-cni-binary-dir",
 			Usage: "path of cni binary files",
-			Value: defaultConf.Workers.Containerd.NetworkConfig.CNIBinaryPath,
+			Value: defaultConf.Workers.Containerd.CNIBinaryPath,
 		},
-		cli.IntFlag{
+		&cli.IntFlag{
 			Name:  "containerd-cni-pool-size",
 			Usage: "size of cni network namespace pool",
-			Value: defaultConf.Workers.Containerd.NetworkConfig.CNIPoolSize,
+			Value: defaultConf.Workers.Containerd.CNIPoolSize,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-worker-snapshotter",
 			Usage: "snapshotter name to use",
-			Value: ctd.DefaultSnapshotter,
+			Value: defaults.DefaultSnapshotter,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "containerd-worker-apparmor-profile",
 			Usage: "set the name of the apparmor profile applied to containers",
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "containerd-worker-selinux",
 			Usage: "apply SELinux labels",
+		},
+		&cli.BoolFlag{
+			Name:  "containerd-worker-hyperv-isolation",
+			Usage: "use Hyper-V isolation for Windows containers",
+			Value: defaultConf.Workers.Containerd.HyperVIsolation,
+		},
+		&cli.IntFlag{
+			Name:  "containerd-max-parallelism",
+			Usage: "limit the number of parallel build steps that can run at the same time",
+			Value: defaultConf.Workers.Containerd.MaxParallelism,
 		},
 	}
 	n := "containerd-worker-rootless"
 	u := "enable rootless mode"
 	if userns.RunningInUserNS() {
-		flags = append(flags, cli.BoolTFlag{
+		flags = append(flags, &cli.BoolFlag{
 			Name:  n,
 			Usage: u,
+			Value: true,
 		})
 	} else {
-		flags = append(flags, cli.BoolFlag{
+		flags = append(flags, &cli.BoolFlag{
 			Name:  n,
 			Usage: u,
 		})
 	}
 
 	if defaultConf.Workers.Containerd.GC == nil || *defaultConf.Workers.Containerd.GC {
-		flags = append(flags, cli.BoolTFlag{
+		flags = append(flags, &cli.BoolFlag{
 			Name:  "containerd-worker-gc",
 			Usage: "Enable automatic garbage collection on worker",
+			Value: true,
 		})
 	} else {
-		flags = append(flags, cli.BoolFlag{
+		flags = append(flags, &cli.BoolFlag{
 			Name:  "containerd-worker-gc",
 			Usage: "Enable automatic garbage collection on worker",
 		})
 	}
-	flags = append(flags, cli.Int64Flag{
+	flags = append(flags, &cli.StringFlag{
 		Name:  "containerd-worker-gc-keepstorage",
-		Usage: "Amount of storage GC keep locally (MB)",
-		Value: func() int64 {
-			keep := defaultConf.Workers.Containerd.GCKeepStorage.AsBytes(defaultConf.Root)
-			if keep == 0 {
-				keep = config.DetectDefaultGCCap().AsBytes(defaultConf.Root)
-			}
-			return keep / 1e6
+		Usage: "Amount of storage GC keep locally, format \"Reserved[,Free[,Maximum]]\" (MB)",
+		Value: func() string {
+			cfg := defaultConf.Workers.Containerd.GCConfig
+			dstat, _ := disk.GetDiskStat(defaultConf.Root)
+			return gcConfigToString(cfg, dstat)
 		}(),
 		Hidden: len(defaultConf.Workers.Containerd.GCPolicy) != 0,
 	})
@@ -176,30 +184,30 @@ func init() {
 	// TODO(AkihiroSuda): allow using multiple snapshotters. should be useful for some applications that does not work with the default overlay snapshotter. e.g. mysql (docker/for-linux#72)",
 }
 
-func applyContainerdFlags(c *cli.Context, cfg *config.Config) error {
+func applyContainerdFlags(c *cli.Command, cfg *config.Config) error {
 	if cfg.Workers.Containerd.Address == "" {
-		cfg.Workers.Containerd.Address = defaultContainerdAddress
+		cfg.Workers.Containerd.Address = defaults.DefaultAddress
 	}
 
-	if c.GlobalIsSet("containerd-worker") {
-		boolOrAuto, err := parseBoolOrAuto(c.GlobalString("containerd-worker"))
+	if c.IsSet("containerd-worker") {
+		boolOrAuto, err := parseBoolOrAuto(c.String("containerd-worker"))
 		if err != nil {
 			return err
 		}
 		cfg.Workers.Containerd.Enabled = boolOrAuto
 	}
 
-	if c.GlobalIsSet("rootless") || c.GlobalBool("rootless") {
-		cfg.Workers.Containerd.Rootless = c.GlobalBool("rootless")
+	if c.IsSet("rootless") || c.Bool("rootless") {
+		cfg.Workers.Containerd.Rootless = c.Bool("rootless")
 	}
-	if c.GlobalIsSet("containerd-worker-rootless") {
+	if c.IsSet("containerd-worker-rootless") {
 		if !userns.RunningInUserNS() || os.Geteuid() > 0 {
 			return errors.New("rootless mode requires to be executed as the mapped root in a user namespace; you may use RootlessKit for setting up the namespace")
 		}
-		cfg.Workers.Containerd.Rootless = c.GlobalBool("containerd-worker-rootless")
+		cfg.Workers.Containerd.Rootless = c.Bool("containerd-worker-rootless")
 	}
 
-	labels, err := attrMap(c.GlobalStringSlice("containerd-worker-labels"))
+	labels, err := attrMap(c.StringSlice("containerd-worker-labels"))
 	if err != nil {
 		return err
 	}
@@ -208,59 +216,71 @@ func applyContainerdFlags(c *cli.Context, cfg *config.Config) error {
 	}
 	maps.Copy(cfg.Workers.Containerd.Labels, labels)
 
-	if c.GlobalIsSet("containerd-worker-addr") {
-		cfg.Workers.Containerd.Address = c.GlobalString("containerd-worker-addr")
+	if c.IsSet("containerd-worker-addr") {
+		cfg.Workers.Containerd.Address = c.String("containerd-worker-addr")
 	}
 
-	if platforms := c.GlobalStringSlice("containerd-worker-platform"); len(platforms) != 0 {
+	if platforms := c.StringSlice("containerd-worker-platform"); len(platforms) != 0 {
 		cfg.Workers.Containerd.Platforms = platforms
 	}
 
-	if c.GlobalIsSet("containerd-worker-namespace") || cfg.Workers.Containerd.Namespace == "" {
-		cfg.Workers.Containerd.Namespace = c.GlobalString("containerd-worker-namespace")
+	if c.IsSet("containerd-worker-namespace") || cfg.Workers.Containerd.Namespace == "" {
+		cfg.Workers.Containerd.Namespace = c.String("containerd-worker-namespace")
 	}
 
-	if c.GlobalIsSet("containerd-worker-runtime") || cfg.Workers.Containerd.Runtime.Name == "" {
+	if c.IsSet("containerd-worker-runtime") || cfg.Workers.Containerd.Runtime.Name == "" {
 		cfg.Workers.Containerd.Runtime = config.ContainerdRuntime{
-			Name: c.GlobalString("containerd-worker-runtime"),
+			Name: c.String("containerd-worker-runtime"),
 		}
 	}
 
-	if c.GlobalIsSet("containerd-worker-gc") {
-		v := c.GlobalBool("containerd-worker-gc")
+	if c.IsSet("containerd-worker-gc") {
+		v := c.Bool("containerd-worker-gc")
 		cfg.Workers.Containerd.GC = &v
 	}
 
-	if c.GlobalIsSet("containerd-worker-gc-keepstorage") {
-		cfg.Workers.Containerd.GCKeepStorage = config.DiskSpace{Bytes: c.GlobalInt64("containerd-worker-gc-keepstorage") * 1e6}
+	if c.IsSet("containerd-worker-gc-keepstorage") {
+		gc, err := stringToGCConfig(c.String("containerd-worker-gc-keepstorage"))
+		if err != nil {
+			return err
+		}
+		cfg.Workers.Containerd.GCReservedSpace = gc.GCReservedSpace
+		cfg.Workers.Containerd.GCMinFreeSpace = gc.GCMinFreeSpace
+		cfg.Workers.Containerd.GCMaxUsedSpace = gc.GCMaxUsedSpace
 	}
 
-	if c.GlobalIsSet("containerd-worker-net") {
-		cfg.Workers.Containerd.NetworkConfig.Mode = c.GlobalString("containerd-worker-net")
+	if c.IsSet("containerd-worker-net") {
+		cfg.Workers.Containerd.Mode = c.String("containerd-worker-net")
 	}
-	if c.GlobalIsSet("containerd-cni-config-path") {
-		cfg.Workers.Containerd.NetworkConfig.CNIConfigPath = c.GlobalString("containerd-cni-config-path")
+	if c.IsSet("containerd-cni-config-path") {
+		cfg.Workers.Containerd.CNIConfigPath = c.String("containerd-cni-config-path")
 	}
-	if c.GlobalIsSet("containerd-cni-pool-size") {
-		cfg.Workers.Containerd.NetworkConfig.CNIPoolSize = c.GlobalInt("containerd-cni-pool-size")
+	if c.IsSet("containerd-cni-pool-size") {
+		cfg.Workers.Containerd.CNIPoolSize = c.Int("containerd-cni-pool-size")
 	}
-	if c.GlobalIsSet("containerd-cni-binary-dir") {
-		cfg.Workers.Containerd.NetworkConfig.CNIBinaryPath = c.GlobalString("containerd-cni-binary-dir")
+	if c.IsSet("containerd-cni-binary-dir") {
+		cfg.Workers.Containerd.CNIBinaryPath = c.String("containerd-cni-binary-dir")
 	}
-	if c.GlobalIsSet("containerd-worker-snapshotter") {
-		cfg.Workers.Containerd.Snapshotter = c.GlobalString("containerd-worker-snapshotter")
+	if c.IsSet("containerd-worker-snapshotter") {
+		cfg.Workers.Containerd.Snapshotter = c.String("containerd-worker-snapshotter")
 	}
-	if c.GlobalIsSet("containerd-worker-apparmor-profile") {
-		cfg.Workers.Containerd.ApparmorProfile = c.GlobalString("containerd-worker-apparmor-profile")
+	if c.IsSet("containerd-worker-apparmor-profile") {
+		cfg.Workers.Containerd.ApparmorProfile = c.String("containerd-worker-apparmor-profile")
 	}
-	if c.GlobalIsSet("containerd-worker-selinux") {
-		cfg.Workers.Containerd.SELinux = c.GlobalBool("containerd-worker-selinux")
+	if c.IsSet("containerd-worker-selinux") {
+		cfg.Workers.Containerd.SELinux = c.Bool("containerd-worker-selinux")
+	}
+	if c.IsSet("containerd-worker-hyperv-isolation") {
+		cfg.Workers.Containerd.HyperVIsolation = c.Bool("containerd-worker-hyperv-isolation")
+	}
+	if c.IsSet("containerd-max-parallelism") {
+		cfg.Workers.Containerd.MaxParallelism = c.Int("containerd-max-parallelism")
 	}
 
 	return nil
 }
 
-func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([]worker.Worker, error) {
+func containerdWorkerInitializer(c *cli.Command, common workerInitializerOpt) ([]worker.Worker, error) {
 	if err := applyContainerdFlags(c, common.config); err != nil {
 		return nil, err
 	}
@@ -273,15 +293,20 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 
 	if cfg.Rootless {
 		bklog.L.Debugf("running in rootless mode")
-		if common.config.Workers.Containerd.NetworkConfig.Mode == "auto" {
-			common.config.Workers.Containerd.NetworkConfig.Mode = "host"
+		if common.config.Workers.Containerd.Mode == "auto" {
+			common.config.Workers.Containerd.Mode = "host"
 		}
 	}
 
 	dns := getDNSConfig(common.config.DNS)
 
+	cdiManager, err := getCDIManager(common.config.CDI)
+	if err != nil {
+		return nil, err
+	}
+
 	nc := netproviders.Opt{
-		Mode: common.config.Workers.Containerd.NetworkConfig.Mode,
+		Mode: common.config.Workers.Containerd.Mode,
 		CNI: cniprovider.Opt{
 			Root:         common.config.Root,
 			ConfigPath:   common.config.Workers.Containerd.CNIConfigPath,
@@ -297,7 +322,7 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		parallelismSem = semaphore.NewWeighted(int64(cfg.MaxParallelism))
 	}
 
-	snapshotter := ctd.DefaultSnapshotter
+	snapshotter := defaults.DefaultSnapshotter
 	if cfg.Snapshotter != "" {
 		snapshotter = cfg.Snapshotter
 	}
@@ -306,11 +331,11 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 	if cfg.Runtime.Name != "" {
 		opts := getRuntimeOptionsType(cfg.Runtime.Name)
 
-		t, err := toml.TreeFromMap(cfg.Runtime.Options)
+		b, err := toml.Marshal(cfg.Runtime.Options)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to parse runtime options config")
 		}
-		err = t.Unmarshal(opts)
+		err = toml.Unmarshal(b, opts)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to parse runtime options config")
 		}
@@ -337,6 +362,8 @@ func containerdWorkerInitializer(c *cli.Context, common workerInitializerOpt) ([
 		ParallelismSem:  parallelismSem,
 		TraceSocket:     common.traceSocket,
 		Runtime:         runtime,
+		CDIManager:      cdiManager,
+		HyperVIsolation: cfg.HyperVIsolation,
 	}
 
 	opt, err := containerd.NewWorkerOpt(workerOpts, ctd.WithTimeout(60*time.Second))

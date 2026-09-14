@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package runc
 
@@ -7,26 +6,31 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
-	ctdsnapshot "github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/overlay"
+	ctdsnapshot "github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/plugins/snapshots/overlay"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/network/netproviders"
 	"github.com/moby/buildkit/worker/base"
 	"github.com/moby/buildkit/worker/tests"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMain(m *testing.M) {
+	defer tests.RunMirror()()
+	m.Run()
+}
 
 func newWorkerOpt(t *testing.T, processMode oci.ProcessMode) base.WorkerOpt {
 	tmpdir := t.TempDir()
@@ -38,7 +42,7 @@ func newWorkerOpt(t *testing.T, processMode oci.ProcessMode) base.WorkerOpt {
 		},
 	}
 	rootless := false
-	workerOpt, err := NewWorkerOpt(tmpdir, snFactory, rootless, processMode, nil, nil, netproviders.Opt{Mode: "host"}, nil, "", "", false, nil, "", "")
+	workerOpt, err := NewWorkerOpt(tmpdir, snFactory, rootless, processMode, nil, nil, netproviders.Opt{Mode: "host"}, nil, "", "", false, nil, "", "", nil)
 	require.NoError(t, err)
 
 	return workerOpt
@@ -61,7 +65,7 @@ func TestRuncWorker(t *testing.T) {
 	checkRequirement(t)
 
 	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	ctx := tests.NewCtx("buildkit-test")
@@ -107,7 +111,7 @@ func TestRuncWorker(t *testing.T) {
 	}
 
 	stderr := bytes.NewBuffer(nil)
-	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(snap, true), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(snap, true), nil, executor.ProcessInfo{Meta: meta, Stderr: &iohelper.NopWriteCloser{Writer: stderr}}, nil)
 	require.Error(t, err) // Read-only root
 	// typical error is like `mkdir /.../rootfs/proc: read-only file system`.
 	// make sure the error is caused before running `echo foo > /bar`.
@@ -116,7 +120,7 @@ func TestRuncWorker(t *testing.T) {
 	root, err := w.CacheMgr.New(ctx, snap, nil, cache.CachePolicyRetain)
 	require.NoError(t, err)
 
-	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &iohelper.NopWriteCloser{Writer: stderr}}, nil)
 	require.NoError(t, err)
 
 	meta = executor.Meta{
@@ -124,7 +128,7 @@ func TestRuncWorker(t *testing.T) {
 		Cwd:  "/",
 	}
 
-	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &nopCloser{stderr}}, nil)
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stderr: &iohelper.NopWriteCloser{Writer: stderr}}, nil)
 	require.NoError(t, err)
 
 	rf, err := root.Commit(ctx)
@@ -182,7 +186,7 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 	checkRequirement(t)
 
 	workerOpt := newWorkerOpt(t, oci.NoProcessSandbox)
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	ctx := tests.NewCtx("buildkit-test")
@@ -202,8 +206,8 @@ func TestRuncWorkerNoProcessSandbox(t *testing.T) {
 	}
 	stdout := bytes.NewBuffer(nil)
 	stderr := bytes.NewBuffer(nil)
-	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stdout: &nopCloser{stdout}, Stderr: &nopCloser{stderr}}, nil)
-	require.NoError(t, err, fmt.Sprintf("stdout=%q, stderr=%q", stdout.String(), stderr.String()))
+	_, err = w.WorkerOpt.Executor.Run(ctx, "", execMount(root, false), nil, executor.ProcessInfo{Meta: meta, Stdout: &iohelper.NopWriteCloser{Writer: stdout}, Stderr: &iohelper.NopWriteCloser{Writer: stderr}}, nil)
+	require.NoError(t, err, "stdout=%q, stderr=%q", stdout.String(), stderr.String())
 	require.Equal(t, string(selfCmdline), stdout.String())
 }
 
@@ -212,7 +216,7 @@ func TestRuncWorkerExec(t *testing.T) {
 	checkRequirement(t)
 
 	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExec(t, w)
@@ -223,7 +227,7 @@ func TestRuncWorkerExecFailures(t *testing.T) {
 	checkRequirement(t)
 
 	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerExecFailures(t, w)
@@ -234,18 +238,10 @@ func TestRuncWorkerCancel(t *testing.T) {
 	checkRequirement(t)
 
 	workerOpt := newWorkerOpt(t, oci.ProcessSandbox)
-	w, err := base.NewWorker(context.TODO(), workerOpt)
+	w, err := base.NewWorker(t.Context(), workerOpt)
 	require.NoError(t, err)
 
 	tests.TestWorkerCancel(t, w)
-}
-
-type nopCloser struct {
-	io.Writer
-}
-
-func (n *nopCloser) Close() error {
-	return nil
 }
 
 func execMount(m cache.Mountable, readonly bool) executor.Mount {

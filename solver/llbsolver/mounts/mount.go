@@ -3,26 +3,22 @@ package mounts
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/moby/buildkit/util/bklog"
-
-	"github.com/containerd/containerd/mount"
-	"github.com/docker/docker/pkg/idtools"
+	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets"
 	"github.com/moby/buildkit/session/sshforward"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/moby/locker"
-	"github.com/moby/sys/user/userns"
+	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc/codes"
 )
@@ -116,7 +112,7 @@ func (g *cacheRefGetter) getRefCacheDirNoCache(ctx context.Context, key string, 
 	cacheRefsLocker.Lock(key)
 	defer cacheRefsLocker.Unlock(key)
 	for {
-		sis, err := SearchCacheDir(ctx, g.cm, key)
+		sis, err := SearchCacheDir(ctx, g.cm, key, false)
 		if err != nil {
 			return nil, err
 		}
@@ -186,7 +182,7 @@ func (mm *MountManager) getSSHMountable(ctx context.Context, m *pb.Mount, g sess
 type sshMount struct {
 	mount  *pb.Mount
 	caller session.Caller
-	idmap  *idtools.IdentityMapping
+	idmap  *user.IdentityMapping
 }
 
 func (sm *sshMount) Mount(ctx context.Context, readonly bool, g session.Group) (snapshot.Mountable, error) {
@@ -195,7 +191,7 @@ func (sm *sshMount) Mount(ctx context.Context, readonly bool, g session.Group) (
 
 type sshMountInstance struct {
 	sm    *sshMount
-	idmap *idtools.IdentityMapping
+	idmap *user.IdentityMapping
 }
 
 func (sm *sshMountInstance) Mount() ([]mount.Mount, func() error, error) {
@@ -205,16 +201,12 @@ func (sm *sshMountInstance) Mount() ([]mount.Mount, func() error, error) {
 	gid := int(sm.sm.mount.SSHOpt.Gid)
 
 	if sm.idmap != nil {
-		identity, err := sm.idmap.ToHost(idtools.Identity{
-			UID: uid,
-			GID: gid,
-		})
+		var err error
+		uid, gid, err = sm.idmap.ToHost(uid, gid)
 		if err != nil {
 			cancel(err)
 			return nil, nil, err
 		}
-		uid = identity.UID
-		gid = identity.GID
 	}
 
 	sock, cleanup, err := sshforward.MountSSHSocket(ctx, sm.sm.caller, sshforward.SocketOpt{
@@ -243,7 +235,7 @@ func (sm *sshMountInstance) Mount() ([]mount.Mount, func() error, error) {
 	}}, release, nil
 }
 
-func (sm *sshMountInstance) IdentityMapping() *idtools.IdentityMapping {
+func (sm *sshMountInstance) IdentityMapping() *user.IdentityMapping {
 	return sm.idmap
 }
 
@@ -251,9 +243,8 @@ func (mm *MountManager) getSecretMountable(ctx context.Context, m *pb.Mount, g s
 	if m.SecretOpt == nil {
 		return nil, errors.Errorf("invalid secret mount options")
 	}
-	sopt := *m.SecretOpt
 
-	id := sopt.ID
+	id := m.SecretOpt.ID
 	if id == "" {
 		return nil, errors.Errorf("secret ID missing from mount options")
 	}
@@ -278,7 +269,7 @@ func (mm *MountManager) getSecretMountable(ctx context.Context, m *pb.Mount, g s
 type secretMount struct {
 	mount *pb.Mount
 	data  []byte
-	idmap *idtools.IdentityMapping
+	idmap *user.IdentityMapping
 }
 
 func (sm *secretMount) Mount(ctx context.Context, readonly bool, g session.Group) (snapshot.Mountable, error) {
@@ -288,92 +279,10 @@ func (sm *secretMount) Mount(ctx context.Context, readonly bool, g session.Group
 type secretMountInstance struct {
 	sm    *secretMount
 	root  string
-	idmap *idtools.IdentityMapping
+	idmap *user.IdentityMapping
 }
 
-func (sm *secretMountInstance) Mount() ([]mount.Mount, func() error, error) {
-	dir, err := os.MkdirTemp("", "buildkit-secrets")
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "failed to create temp dir")
-	}
-	cleanupDir := func() error {
-		return os.RemoveAll(dir)
-	}
-
-	if err := os.Chmod(dir, 0711); err != nil {
-		cleanupDir()
-		return nil, nil, err
-	}
-
-	var mountOpts []string
-	if sm.sm.mount.SecretOpt.Mode&0o111 == 0 {
-		mountOpts = append(mountOpts, "noexec")
-	}
-
-	tmpMount := mount.Mount{
-		Type:    "tmpfs",
-		Source:  "tmpfs",
-		Options: append([]string{"nodev", "nosuid", fmt.Sprintf("uid=%d,gid=%d", os.Geteuid(), os.Getegid())}, mountOpts...),
-	}
-
-	if userns.RunningInUserNS() {
-		tmpMount.Options = nil
-	}
-
-	if err := mount.All([]mount.Mount{tmpMount}, dir); err != nil {
-		cleanupDir()
-		return nil, nil, errors.Wrap(err, "unable to setup secret mount")
-	}
-	sm.root = dir
-
-	cleanup := func() error {
-		if err := mount.Unmount(dir, 0); err != nil {
-			return err
-		}
-		return cleanupDir()
-	}
-
-	randID := identity.NewID()
-	fp := filepath.Join(dir, randID)
-	if err := os.WriteFile(fp, sm.sm.data, 0600); err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-
-	uid := int(sm.sm.mount.SecretOpt.Uid)
-	gid := int(sm.sm.mount.SecretOpt.Gid)
-
-	if sm.idmap != nil {
-		identity, err := sm.idmap.ToHost(idtools.Identity{
-			UID: uid,
-			GID: gid,
-		})
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-		uid = identity.UID
-		gid = identity.GID
-	}
-
-	if err := os.Chown(fp, uid, gid); err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-
-	if err := os.Chmod(fp, os.FileMode(sm.sm.mount.SecretOpt.Mode&0777)); err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-
-	return []mount.Mount{{
-		Type:    "bind",
-		Source:  fp,
-		Options: append([]string{"ro", "rbind", "nodev", "nosuid"}, mountOpts...),
-	}}, cleanup, nil
-}
-
-func (sm *secretMountInstance) IdentityMapping() *idtools.IdentityMapping {
+func (sm *secretMountInstance) IdentityMapping() *user.IdentityMapping {
 	return sm.idmap
 }
 
@@ -396,12 +305,12 @@ func (mm *MountManager) MountableSSH(ctx context.Context, m *pb.Mount, g session
 	return mm.getSSHMountable(ctx, m, g)
 }
 
-func newTmpfs(idmap *idtools.IdentityMapping, opt *pb.TmpfsOpt) cache.Mountable {
+func newTmpfs(idmap *user.IdentityMapping, opt *pb.TmpfsOpt) cache.Mountable {
 	return &tmpfs{idmap: idmap, opt: opt}
 }
 
 type tmpfs struct {
-	idmap *idtools.IdentityMapping
+	idmap *user.IdentityMapping
 	opt   *pb.TmpfsOpt
 }
 
@@ -411,7 +320,7 @@ func (f *tmpfs) Mount(ctx context.Context, readonly bool, g session.Group) (snap
 
 type tmpfsMount struct {
 	readonly bool
-	idmap    *idtools.IdentityMapping
+	idmap    *user.IdentityMapping
 	opt      *pb.TmpfsOpt
 }
 
@@ -421,8 +330,8 @@ func (m *tmpfsMount) Mount() ([]mount.Mount, func() error, error) {
 		opt = append(opt, "ro")
 	}
 	if m.opt != nil {
-		if m.opt.Size_ > 0 {
-			opt = append(opt, fmt.Sprintf("size=%d", m.opt.Size_))
+		if m.opt.Size > 0 {
+			opt = append(opt, fmt.Sprintf("size=%d", m.opt.Size))
 		}
 	}
 	return []mount.Mount{{
@@ -432,12 +341,14 @@ func (m *tmpfsMount) Mount() ([]mount.Mount, func() error, error) {
 	}}, func() error { return nil }, nil
 }
 
-func (m *tmpfsMount) IdentityMapping() *idtools.IdentityMapping {
+func (m *tmpfsMount) IdentityMapping() *user.IdentityMapping {
 	return m.idmap
 }
 
-var cacheRefsLocker = locker.New()
-var sharedCacheRefs = &cacheRefs{}
+var (
+	cacheRefsLocker = locker.New()
+	sharedCacheRefs = &cacheRefs{}
+)
 
 type cacheRefs struct {
 	mu     sync.Mutex
@@ -508,11 +419,13 @@ func (r *cacheRefShare) release(ctx context.Context) error {
 	if r.main != nil {
 		delete(r.main.shares, r.key)
 	}
-	return r.MutableRef.Release(ctx)
+	return r.Release(ctx)
 }
 
-var cacheRefReleaseHijack func()
-var cacheRefCloneHijack func()
+var (
+	cacheRefReleaseHijack func()
+	cacheRefCloneHijack   func()
+)
 
 type cacheRef struct {
 	*cacheRefShare
@@ -539,16 +452,29 @@ func (r *cacheRef) Release(ctx context.Context) error {
 	return nil
 }
 
-const keyCacheDir = "cache-dir"
-const cacheDirIndex = keyCacheDir + ":"
+const (
+	keyCacheDir   = "cache-dir"
+	cacheDirIndex = keyCacheDir + ":"
+)
 
-func SearchCacheDir(ctx context.Context, store cache.MetadataStore, id string) ([]CacheRefMetadata, error) {
+func SearchCacheDir(ctx context.Context, store cache.MetadataStore, id string, withNested bool) ([]CacheRefMetadata, error) {
 	var results []CacheRefMetadata
-	mds, err := store.Search(ctx, cacheDirIndex+id)
+	key := cacheDirIndex + id
+	if withNested {
+		key += ":"
+	}
+	mds, err := store.Search(ctx, key, withNested)
 	if err != nil {
 		return nil, err
 	}
 	for _, md := range mds {
+		if withNested {
+			v := md.Get(keyCacheDir)
+			// skip partial ids but allow id without ref ID
+			if v == nil || v.Index != key && !strings.HasPrefix(v.Index, key) {
+				continue
+			}
+		}
 		results = append(results, CacheRefMetadata{md})
 	}
 	return results, nil

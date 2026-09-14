@@ -8,8 +8,8 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	digest "github.com/opencontainers/go-digest"
@@ -18,7 +18,7 @@ import (
 )
 
 func TestConfigMultiplatform(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	cc := &testCache{}
 
@@ -193,7 +193,7 @@ type raReader struct {
 }
 
 func (r *raReader) Read(p []byte) (int, error) {
-	n, err := r.ReaderAt.ReadAt(p, int64(r.pos))
+	n, err := r.ReadAt(p, int64(r.pos))
 	r.pos += n
 	return n, err
 }

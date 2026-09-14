@@ -1,6 +1,3 @@
-//go:build dfrunsecurity
-// +build dfrunsecurity
-
 package dockerfile
 
 import (
@@ -15,7 +12,8 @@ import (
 	"github.com/tonistiigi/fsutil"
 )
 
-var runSecurityTests = integration.TestFuncs(
+// Tests that depend on the `security.*` entitlements
+var securityTests = integration.TestFuncs(
 	testRunSecurityInsecure,
 	testRunSecuritySandbox,
 	testRunSecurityDefault,
@@ -29,8 +27,6 @@ func init() {
 			"tonistiigi/hellofs:latest": "docker.io/tonistiigi/hellofs:latest",
 		}),
 	}
-
-	securityTests = append(securityTests, runSecurityTests...)
 }
 
 func testInsecureDevicesWhitelist(t *testing.T, sb integration.Sandbox) {
@@ -72,7 +68,7 @@ RUN --security=insecure ls -l /dev && dd if=/dev/zero of=disk.img bs=20M count=1
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure},
+		AllowedEntitlements: []string{entitlements.EntitlementSecurityInsecure.String()},
 	}, nil)
 
 	secMode := sb.Value("security.insecure")
@@ -110,7 +106,7 @@ RUN [ "$(cat /proc/self/status | grep CapBnd)" == "CapBnd:	00000000a80425fb" ]
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure},
+		AllowedEntitlements: []string{entitlements.EntitlementSecurityInsecure.String()},
 	}, nil)
 
 	secMode := sb.Value("security.insecure")
@@ -174,7 +170,7 @@ RUN [ "$(cat /proc/self/status | grep CapBnd)" == "CapBnd:	00000000a80425fb" ]
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementSecurityInsecure},
+		AllowedEntitlements: []string{entitlements.EntitlementSecurityInsecure.String()},
 	}, nil)
 
 	secMode := sb.Value("security.insecure")

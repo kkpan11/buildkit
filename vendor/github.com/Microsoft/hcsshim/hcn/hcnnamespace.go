@@ -4,6 +4,7 @@ package hcn
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"syscall"
 
@@ -17,12 +18,12 @@ import (
 
 // NamespaceResourceEndpoint represents an Endpoint attached to a Namespace.
 type NamespaceResourceEndpoint struct {
-	Id string `json:"ID,"`
+	Id string `json:"ID"`
 }
 
 // NamespaceResourceContainer represents a Container attached to a Namespace.
 type NamespaceResourceContainer struct {
-	Id string `json:"ID,"`
+	Id string `json:"ID"`
 }
 
 // NamespaceResourceType determines whether the Namespace resource is a Container or Endpoint.
@@ -37,8 +38,8 @@ var (
 
 // NamespaceResource is associated with a namespace
 type NamespaceResource struct {
-	Type NamespaceResourceType `json:","` // Container, Endpoint
-	Data json.RawMessage       `json:","`
+	Type NamespaceResourceType `json:""` // Container, Endpoint
+	Data json.RawMessage       `json:""`
 }
 
 // NamespaceType determines whether the Namespace is for a Host or Guest
@@ -378,7 +379,8 @@ func (namespace *HostComputeNamespace) Sync() error {
 	shimPath := runhcs.VMPipePath(cfg.HostUniqueID)
 	if err := runhcs.IssueVMRequest(shimPath, &req); err != nil {
 		// The shim is likely gone. Simply ignore the sync as if it didn't exist.
-		if perr, ok := err.(*os.PathError); ok && perr.Err == syscall.ERROR_FILE_NOT_FOUND {
+		var perr *os.PathError
+		if errors.As(err, &perr) && errors.Is(perr.Err, syscall.ERROR_FILE_NOT_FOUND) {
 			// Remove the reg key there is no point to try again
 			_ = cfg.Remove()
 			return nil

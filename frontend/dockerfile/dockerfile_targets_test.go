@@ -3,7 +3,6 @@ package dockerfile
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
@@ -25,22 +24,25 @@ var targetsTests = integration.TestFuncs(
 )
 
 func testTargetsList(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureFrontendTargets)
 	f := getFrontend(t, sb)
 	if _, ok := f.(*clientFrontend); !ok {
 		t.Skip("only test with client frontend")
 	}
 
+	// Use platform-appropriate base images
+	baseImage1 := integration.UnixOrWindows("alpine", "nanoserver:latest")
+	baseImage2 := integration.UnixOrWindows("busybox", "nanoserver:latest")
+
 	dockerfile := []byte(`
 # build defines stage for compiling the binary
-FROM alpine AS build
+FROM ` + baseImage1 + ` AS build
 RUN true
 
-FROM busybox as second
+FROM ` + baseImage2 + ` as second
 RUN false
 
-FROM alpine
+FROM ` + baseImage1 + `
 RUN false
 
 # binary returns the compiled binary
@@ -49,16 +51,12 @@ FROM second AS binary
 
 	dir := integration.Tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
-
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
 
 	called := false
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
@@ -81,7 +79,7 @@ FROM second AS binary
 
 		target := list.Targets[0]
 		require.Equal(t, "build", target.Name)
-		require.Equal(t, "alpine", target.Base)
+		require.Equal(t, baseImage1, target.Base)
 		require.Equal(t, "defines stage for compiling the binary", target.Description)
 		require.Equal(t, false, target.Default)
 		require.Equal(t, int32(0), target.Location.SourceIndex)
@@ -90,7 +88,7 @@ FROM second AS binary
 		target = list.Targets[1]
 		require.Equal(t, "second", target.Name)
 		require.Equal(t, "", target.Description)
-		require.Equal(t, "busybox", target.Base)
+		require.Equal(t, baseImage2, target.Base)
 		require.Equal(t, false, target.Default)
 		require.Equal(t, int32(0), target.Location.SourceIndex)
 		require.Equal(t, int32(6), target.Location.Ranges[0].Start.Line)
@@ -98,7 +96,7 @@ FROM second AS binary
 		target = list.Targets[2]
 		require.Equal(t, "", target.Name)
 		require.Equal(t, "", target.Description)
-		require.Equal(t, "alpine", target.Base)
+		require.Equal(t, baseImage1, target.Base)
 		require.Equal(t, false, target.Default)
 		require.Equal(t, int32(0), target.Location.SourceIndex)
 		require.Equal(t, int32(9), target.Location.Ranges[0].Start.Line)
@@ -125,7 +123,6 @@ FROM second AS binary
 }
 
 func testTargetsDescribeDefinition(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureFrontendTargets)
 	f := getFrontend(t, sb)
 	if _, ok := f.(*clientFrontend); !ok {
@@ -136,10 +133,16 @@ func testTargetsDescribeDefinition(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM scratch
 COPY Dockerfile Dockerfile
-`)
+`,
+		`
+FROM nanoserver
+COPY Dockerfile Dockerfile
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -183,7 +186,7 @@ COPY Dockerfile Dockerfile
 func unmarshalTargets(res *gateway.Result) (*targets.List, error) {
 	dt, ok := res.Metadata["result.json"]
 	if !ok {
-		return nil, errors.Errorf("missing frontend.outline")
+		return nil, errors.New("missing frontend.outline")
 	}
 	var l targets.List
 	if err := json.Unmarshal(dt, &l); err != nil {

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"testing"
@@ -24,6 +27,7 @@ type MinioOpts struct {
 	Region          string
 	AccessKeyID     string
 	SecretAccessKey string
+	RequestVerifier func(*http.Request) error
 }
 
 func NewMinioServer(t *testing.T, sb integration.Sandbox, opts MinioOpts) (address string, bucket string, cl func() error, err error) {
@@ -47,7 +51,8 @@ func NewMinioServer(t *testing.T, sb integration.Sandbox, opts MinioOpts) (addre
 		}
 	}()
 
-	l, err := net.Listen("tcp", "localhost:0")
+	listener := net.ListenConfig{}
+	l, err := listener.Listen(t.Context(), "tcp", "localhost:0")
 	if err != nil {
 		return "", "", nil, err
 	}
@@ -59,7 +64,7 @@ func NewMinioServer(t *testing.T, sb integration.Sandbox, opts MinioOpts) (addre
 	address = "http://" + addr
 
 	// start server
-	cmd := exec.Command(minioBin, "server", "--json", "--address", addr, t.TempDir())
+	cmd := exec.CommandContext(t.Context(), minioBin, "server", "--json", "--address", addr, t.TempDir())
 	cmd.Env = append(os.Environ(), []string{
 		"MINIO_ROOT_USER=" + opts.AccessKeyID,
 		"MINIO_ROOT_PASSWORD=" + opts.SecretAccessKey,
@@ -76,40 +81,67 @@ func NewMinioServer(t *testing.T, sb integration.Sandbox, opts MinioOpts) (addre
 
 	// create alias config
 	alias := randomString(10)
-	cmd = exec.Command(mcBin, "alias", "set", alias, address, opts.AccessKeyID, opts.SecretAccessKey)
+	cmd = exec.CommandContext(t.Context(), mcBin, "alias", "set", alias, address, opts.AccessKeyID, opts.SecretAccessKey)
 	if err := integration.RunCmd(cmd, sb.Logs()); err != nil {
 		return "", "", nil, err
 	}
 	deferF.Append(func() error {
-		return exec.Command(mcBin, "alias", "rm", alias).Run()
+		return exec.CommandContext(t.Context(), mcBin, "alias", "rm", alias).Run()
 	})
 
 	// create bucket
-	cmd = exec.Command(mcBin, "mb", "--region", opts.Region, fmt.Sprintf("%s/%s", alias, bucket)) // #nosec G204
+	cmd = exec.CommandContext(t.Context(), mcBin, "mb", "--region", opts.Region, fmt.Sprintf("%s/%s", alias, bucket)) // #nosec G204
 	if err := integration.RunCmd(cmd, sb.Logs()); err != nil {
 		return "", "", nil, err
 	}
 
 	// trace
-	cmd = exec.Command(mcBin, "admin", "trace", "--json", alias)
+	cmd = exec.CommandContext(t.Context(), mcBin, "admin", "trace", "--json", alias)
 	traceStop, err := integration.StartCmd(cmd, sb.Logs())
 	if err != nil {
 		return "", "", nil, err
 	}
 	deferF.Append(traceStop)
 
+	if opts.RequestVerifier != nil {
+		proxyAddr, proxyStop, err := newMinioProxy(address, opts.RequestVerifier)
+		if err != nil {
+			return "", "", nil, err
+		}
+		deferF.Append(proxyStop)
+		address = proxyAddr
+	}
+
 	return
+}
+
+func newMinioProxy(target string, verify func(*http.Request) error) (string, func() error, error) {
+	u, err := url.Parse(target)
+	if err != nil {
+		return "", nil, err
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := verify(r); err != nil {
+			http.Error(w, err.Error(), http.StatusNotImplemented)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	return server.URL, func() error {
+		server.Close()
+		return nil
+	}, nil
 }
 
 func waitMinio(ctx context.Context, address string, d time.Duration) error {
 	step := 1 * time.Second
 	i := 0
 	for {
-		req, err := http.NewRequest("GET", fmt.Sprintf("%s/minio/health/live", address), nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/minio/health/live", address), nil)
 		if err != nil {
 			return errors.Wrapf(err, "failed to create request")
 		}
-		req = req.WithContext(ctx)
 		if resp, err := http.DefaultClient.Do(req); err == nil {
 			resp.Body.Close()
 			break

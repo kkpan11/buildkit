@@ -30,7 +30,7 @@ func init() {
 
 func TestSingleLevelActiveGraph(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -209,7 +209,7 @@ func TestSingleLevelActiveGraph(t *testing.T) {
 
 func TestSingleLevelCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -305,7 +305,7 @@ func TestSingleLevelCache(t *testing.T) {
 
 func TestSingleLevelCacheParallel(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -380,7 +380,7 @@ func TestSingleLevelCacheParallel(t *testing.T) {
 
 func TestMultiLevelCacheParallel(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -471,7 +471,7 @@ func TestMultiLevelCacheParallel(t *testing.T) {
 
 func TestSingleCancelCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -513,7 +513,7 @@ func TestSingleCancelCache(t *testing.T) {
 }
 func TestSingleCancelExec(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -556,7 +556,7 @@ func TestSingleCancelExec(t *testing.T) {
 
 func TestSingleCancelParallel(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -580,7 +580,7 @@ func TestSingleCancelParallel(t *testing.T) {
 		}()
 
 		ctx, cancel := context.WithCancelCause(ctx)
-		defer cancel(errors.WithStack(context.Canceled))
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 		g := Edge{
 			Vertex: vtx(vtxOpt{
@@ -631,7 +631,7 @@ func TestSingleCancelParallel(t *testing.T) {
 
 func TestMultiLevelCalculation(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -714,7 +714,7 @@ func TestMultiLevelCalculation(t *testing.T) {
 
 func TestHugeGraph(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -736,7 +736,7 @@ func TestHugeGraph(t *testing.T) {
 	nodes := 1000
 
 	g, v := generateSubGraph(nodes)
-	// printGraph(g, "")
+	// PrintGraph(g, "")
 	g.Vertex.(*vertexSum).setupCallCounters()
 
 	res, err := j0.Build(ctx, g)
@@ -774,7 +774,7 @@ func TestHugeGraph(t *testing.T) {
 // they are really needed
 func TestOptimizedCacheAccess(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -881,7 +881,7 @@ func TestOptimizedCacheAccess(t *testing.T) {
 // inputs that didn't.
 func TestOptimizedCacheAccess2(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -1032,7 +1032,7 @@ func TestOptimizedCacheAccess2(t *testing.T) {
 
 func TestSlowCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1108,10 +1108,75 @@ func TestSlowCache(t *testing.T) {
 	j1 = nil
 }
 
+func TestSlowCacheErrorResultCloneRelease(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	l := NewSolver(SolverOpt{
+		ResolveOpFunc: testOpResolver,
+	})
+	defer l.Close()
+
+	j, err := l.NewJob("j0")
+	require.NoError(t, err)
+	defer func() {
+		if j != nil {
+			require.NoError(t, j.Discard())
+		}
+	}()
+
+	var releaseCount atomic.Int64
+
+	inputRes := &countedResult{
+		id:           identity.NewID(),
+		value:        "input",
+		releaseCount: &releaseCount,
+	}
+
+	g := Edge{
+		Vertex: vtx(vtxOpt{
+			name:         "v0",
+			cacheKeySeed: "seed0",
+			value:        "result0",
+			inputs: []Edge{
+				{Vertex: vtx(vtxOpt{
+					name:         "v1",
+					cacheKeySeed: "seed1",
+					result:       inputRes,
+				})},
+			},
+			slowCacheCompute: map[int]ResultBasedCacheFunc{
+				0: func(context.Context, Result, session.Group) (digest.Digest, error) {
+					return "", errors.New("slow cache error")
+				},
+			},
+		}),
+	}
+
+	_, err = j.Build(ctx, g)
+	require.Error(t, err)
+
+	var sce *SlowCacheError
+	require.ErrorAs(t, err, &sce)
+	require.NotNil(t, sce.Result)
+
+	require.NoError(t, j.Discard())
+	j = nil
+
+	require.Never(t, func() bool {
+		return releaseCount.Load() != 0
+	}, 100*time.Millisecond, 10*time.Millisecond)
+
+	require.NoError(t, sce.Result.Release(ctx))
+	require.Eventually(t, func() bool {
+		return releaseCount.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
 // TestParallelInputs validates that inputs are processed in parallel
 func TestParallelInputs(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1167,7 +1232,7 @@ func TestParallelInputs(t *testing.T) {
 
 func TestErrorReturns(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1194,7 +1259,7 @@ func TestErrorReturns(t *testing.T) {
 					cacheKeySeed: "seed1",
 					value:        "result1",
 					cachePreFunc: func(ctx context.Context) error {
-						return errors.Errorf("error-from-test")
+						return errors.New("error-from-test")
 					},
 				})},
 				{Vertex: vtx(vtxOpt{
@@ -1281,7 +1346,7 @@ func TestErrorReturns(t *testing.T) {
 					cacheKeySeed: "seed3",
 					value:        "result2",
 					execPreFunc: func(ctx context.Context) error {
-						return errors.Errorf("exec-error-from-test")
+						return errors.New("exec-error-from-test")
 					},
 				})},
 			},
@@ -1298,7 +1363,7 @@ func TestErrorReturns(t *testing.T) {
 
 func TestMultipleCacheSources(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -1416,7 +1481,7 @@ func TestMultipleCacheSources(t *testing.T) {
 
 func TestRepeatBuildWithIgnoreCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1540,7 +1605,7 @@ func TestRepeatBuildWithIgnoreCache(t *testing.T) {
 // with ignore-cache generates same slow cache key
 func TestIgnoreCacheResumeFromSlowCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1629,7 +1694,7 @@ func TestIgnoreCacheResumeFromSlowCache(t *testing.T) {
 
 func TestParallelBuildsIgnoreCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1786,7 +1851,7 @@ func TestParallelBuildsIgnoreCache(t *testing.T) {
 
 func TestSubbuild(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	l := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -1847,7 +1912,7 @@ func TestSubbuild(t *testing.T) {
 
 func TestCacheWithSelector(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -1981,7 +2046,7 @@ func TestCacheWithSelector(t *testing.T) {
 
 func TestCacheSlowWithSelector(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2080,7 +2145,7 @@ func TestCacheSlowWithSelector(t *testing.T) {
 
 func TestCacheExporting(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2120,15 +2185,13 @@ func TestCacheExporting(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-
-	require.Equal(t, 3, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 3, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
-	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 2, expTarget.records[0].links)
+	require.Equal(t, 1, expTarget.records[5].results)
+	require.Equal(t, 0, expTarget.records[0].links)
 	require.Equal(t, 0, expTarget.records[1].links)
-	require.Equal(t, 0, expTarget.records[2].links)
+	require.Equal(t, 2, expTarget.records[5].links)
 
 	j1, err := l.NewJob("j1")
 	require.NoError(t, err)
@@ -2151,20 +2214,19 @@ func TestCacheExporting(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
 	// the order of the records isn't really significant
-	require.Equal(t, 3, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 3, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
-	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 2, expTarget.records[0].links)
+	require.Equal(t, 1, expTarget.records[5].results)
+	require.Equal(t, 0, expTarget.records[0].links)
 	require.Equal(t, 0, expTarget.records[1].links)
-	require.Equal(t, 0, expTarget.records[2].links)
+	require.Equal(t, 2, expTarget.records[5].links)
 }
 
 func TestCacheExportingModeMin(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2208,17 +2270,16 @@ func TestCacheExportingModeMin(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(false))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-
-	require.Equal(t, 4, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 4, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
 	require.Equal(t, 0, expTarget.records[2].results)
 	require.Equal(t, 0, expTarget.records[3].results)
-	require.Equal(t, 2, expTarget.records[0].links)
-	require.Equal(t, 1, expTarget.records[1].links)
-	require.Equal(t, 0, expTarget.records[2].links)
-	require.Equal(t, 0, expTarget.records[3].links)
+	require.Equal(t, 1, expTarget.records[7].results)
+	require.Equal(t, 0, expTarget.records[0].links)
+	require.Equal(t, 0, expTarget.records[1].links)
+	require.Equal(t, 1, expTarget.records[2].links)
+	require.Equal(t, 2, expTarget.records[7].links)
 
 	j1, err := l.NewJob("j1")
 	require.NoError(t, err)
@@ -2241,17 +2302,18 @@ func TestCacheExportingModeMin(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(false))
 	require.NoError(t, err)
 
-	expTarget.normalize()
 	// the order of the records isn't really significant
-	require.Equal(t, 4, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 4, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
 	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 0, expTarget.records[3].results)
-	require.Equal(t, 2, expTarget.records[0].links)
-	require.Equal(t, 1, expTarget.records[1].links)
-	require.Equal(t, 0, expTarget.records[2].links)
-	require.Equal(t, 0, expTarget.records[3].links)
+	require.Equal(t, 1, expTarget.records[7].results)
+	require.Equal(t, 0, expTarget.records[0].links)
+	require.Equal(t, 0, expTarget.records[1].links)
+	require.Equal(t, 1, expTarget.records[2].links)
+	require.Equal(t, 1, expTarget.records[3].links)
+	require.Equal(t, 2, expTarget.records[6].links)
+	require.Equal(t, 2, expTarget.records[7].links)
 
 	// one more check with all mode
 	j2, err := l.NewJob("j2")
@@ -2275,22 +2337,22 @@ func TestCacheExportingModeMin(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
 	// the order of the records isn't really significant
-	require.Equal(t, 4, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
-	require.Equal(t, 1, expTarget.records[1].results)
+	require.Equal(t, 4, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
+	require.Equal(t, 0, expTarget.records[1].results)
 	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 0, expTarget.records[3].results)
-	require.Equal(t, 2, expTarget.records[0].links)
-	require.Equal(t, 1, expTarget.records[1].links)
-	require.Equal(t, 0, expTarget.records[2].links)
-	require.Equal(t, 0, expTarget.records[3].links)
+	require.Equal(t, 1, expTarget.records[3].results)
+	require.Equal(t, 1, expTarget.records[7].results)
+	require.Equal(t, 0, expTarget.records[0].links)
+	require.Equal(t, 0, expTarget.records[1].links)
+	require.Equal(t, 1, expTarget.records[2].links)
+	require.Equal(t, 2, expTarget.records[6].links)
 }
 
 func TestSlowCacheAvoidAccess(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2383,7 +2445,7 @@ func TestSlowCacheAvoidAccess(t *testing.T) {
 // moby/buildkit#648
 func TestSlowCacheAvoidLoadOnCache(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2535,7 +2597,7 @@ func TestSlowCacheAvoidLoadOnCache(t *testing.T) {
 
 func TestCacheMultipleMaps(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2577,8 +2639,7 @@ func TestCacheMultipleMaps(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-	require.Equal(t, 3, len(expTarget.records))
+	require.Equal(t, 3, expTarget.numUniqueRecords())
 
 	j1, err := l.NewJob("j1")
 	require.NoError(t, err)
@@ -2613,7 +2674,7 @@ func TestCacheMultipleMaps(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	require.Equal(t, 3, len(expTarget.records))
+	require.Equal(t, 3, expTarget.numUniqueRecords())
 	require.Equal(t, false, called)
 
 	j2, err := l.NewJob("j2")
@@ -2648,13 +2709,13 @@ func TestCacheMultipleMaps(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	require.Equal(t, 3, len(expTarget.records))
+	require.Equal(t, 3, expTarget.numUniqueRecords())
 	require.Equal(t, true, called)
 }
 
 func TestCacheInputMultipleMaps(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2699,8 +2760,7 @@ func TestCacheInputMultipleMaps(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-	require.Equal(t, 3, len(expTarget.records))
+	require.Equal(t, 3, expTarget.numUniqueRecords())
 
 	require.NoError(t, j0.Discard())
 	j0 = nil
@@ -2738,8 +2798,7 @@ func TestCacheInputMultipleMaps(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-	require.Equal(t, 3, len(expTarget.records))
+	require.Equal(t, 3, expTarget.numUniqueRecords())
 
 	require.NoError(t, j1.Discard())
 	j1 = nil
@@ -2747,7 +2806,7 @@ func TestCacheInputMultipleMaps(t *testing.T) {
 
 func TestCacheExportingPartialSelector(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -2799,14 +2858,15 @@ func TestCacheExportingPartialSelector(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-	require.Equal(t, 3, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 3, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
 	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 2, expTarget.records[0].links)
+	require.Equal(t, 1, expTarget.records[5].results)
+	require.Equal(t, 0, expTarget.records[0].links)
 	require.Equal(t, 0, expTarget.records[1].links)
 	require.Equal(t, 0, expTarget.records[2].links)
+	require.Equal(t, 1, expTarget.records[5].links)
 
 	// repeat so that all coming from cache are retained
 	j1, err := l.NewJob("j1")
@@ -2832,16 +2892,14 @@ func TestCacheExportingPartialSelector(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-
 	// the order of the records isn't really significant
-	require.Equal(t, 3, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 3, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
-	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 2, expTarget.records[0].links)
+	require.Equal(t, 1, expTarget.records[4].results)
+	require.Equal(t, 0, expTarget.records[0].links)
 	require.Equal(t, 0, expTarget.records[1].links)
-	require.Equal(t, 0, expTarget.records[2].links)
+	require.Equal(t, 1, expTarget.records[4].links)
 
 	// repeat with forcing a slow key recomputation
 	j2, err := l.NewJob("j2")
@@ -2886,19 +2944,16 @@ func TestCacheExportingPartialSelector(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-
 	// the order of the records isn't really significant
 	// adds one
-	require.Equal(t, 4, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
+	require.Equal(t, 4, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
 	require.Equal(t, 0, expTarget.records[1].results)
-	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 0, expTarget.records[3].results)
-	require.Equal(t, 3, expTarget.records[0].links)
+	require.Equal(t, 1, expTarget.records[6].results)
+	require.Equal(t, 0, expTarget.records[0].links)
 	require.Equal(t, 0, expTarget.records[1].links)
 	require.Equal(t, 0, expTarget.records[2].links)
-	require.Equal(t, 0, expTarget.records[3].links)
+	require.Equal(t, 1, expTarget.records[6].links)
 
 	// repeat with a wrapper
 	j3, err := l.NewJob("j3")
@@ -2932,26 +2987,24 @@ func TestCacheExportingPartialSelector(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-
 	// adds one extra result
 	// the order of the records isn't really significant
-	require.Equal(t, 5, len(expTarget.records))
-	require.Equal(t, 1, expTarget.records[0].results)
-	require.Equal(t, 1, expTarget.records[1].results)
+	require.Equal(t, 5, expTarget.numUniqueRecords())
+	require.Equal(t, 0, expTarget.records[0].results)
+	require.Equal(t, 0, expTarget.records[1].results)
 	require.Equal(t, 0, expTarget.records[2].results)
-	require.Equal(t, 0, expTarget.records[3].results)
-	require.Equal(t, 0, expTarget.records[4].results)
-	require.Equal(t, 1, expTarget.records[0].links)
-	require.Equal(t, 3, expTarget.records[1].links)
+	require.Equal(t, 1, expTarget.records[5].results)
+	require.Equal(t, 1, expTarget.records[7].results)
+	require.Equal(t, 0, expTarget.records[0].links)
+	require.Equal(t, 0, expTarget.records[1].links)
 	require.Equal(t, 0, expTarget.records[2].links)
-	require.Equal(t, 0, expTarget.records[3].links)
-	require.Equal(t, 0, expTarget.records[4].links)
+	require.Equal(t, 1, expTarget.records[5].links)
+	require.Equal(t, 1, expTarget.records[7].links)
 }
 
 func TestCacheExportingMergedKey(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -3030,9 +3083,7 @@ func TestCacheExportingMergedKey(t *testing.T) {
 	_, err = res.CacheKeys()[0].Exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
 	require.NoError(t, err)
 
-	expTarget.normalize()
-
-	require.Equal(t, 5, len(expTarget.records))
+	require.Equal(t, 5, expTarget.numUniqueRecords())
 }
 
 // moby/buildkit#434
@@ -3040,9 +3091,9 @@ func TestMergedEdgesLookup(t *testing.T) {
 	t.Parallel()
 
 	// this test requires multiple runs to trigger the race
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		func() {
-			ctx := context.TODO()
+			ctx := t.Context()
 
 			cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -3092,8 +3143,8 @@ func TestMergedEdgesLookup(t *testing.T) {
 func TestMergedEdgesCycle(t *testing.T) {
 	t.Parallel()
 
-	for i := 0; i < 20; i++ {
-		ctx := context.TODO()
+	for range 20 {
+		ctx := t.Context()
 
 		cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -3147,8 +3198,8 @@ func TestMergedEdgesCycle(t *testing.T) {
 func TestMergedEdgesCycleMultipleOwners(t *testing.T) {
 	t.Parallel()
 
-	for i := 0; i < 20; i++ {
-		ctx := context.TODO()
+	for range 20 {
+		ctx := t.Context()
 
 		cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -3210,10 +3261,60 @@ func TestMergedEdgesCycleMultipleOwners(t *testing.T) {
 	}
 }
 
+func TestCacheErrNotFound(t *testing.T) {
+	ctx := t.Context()
+
+	cm := newTrackingCacheManager(NewInMemoryCacheManager())
+	l := NewSolver(SolverOpt{
+		ResolveOpFunc: testOpResolver,
+		DefaultCache:  cm,
+	})
+	defer l.Close()
+
+	j0, err := l.NewJob("j0")
+	require.NoError(t, err)
+
+	defer func() {
+		if j0 != nil {
+			j0.Discard()
+		}
+	}()
+
+	g0 := Edge{
+		Vertex: vtxSum(1, vtxOpt{
+			inputs: []Edge{
+				{Vertex: vtxConst(2, vtxOpt{})},
+				{Vertex: vtxConst(3, vtxOpt{})},
+			},
+		}),
+	}
+
+	res, err := j0.Build(ctx, g0)
+	require.NoError(t, err)
+	require.Equal(t, 6, unwrapInt(res))
+
+	require.NoError(t, j0.Discard())
+	j0 = nil
+
+	expTarget := newTestExporterTarget()
+
+	key := res.CacheKeys()[0]
+	internal := cm.CacheManager.(*cacheManager)
+	store := internal.backend.(*inMemoryStore)
+	exporter := key.Exporter.(*mergedExporter).exporters[0].(*exporter)
+	record := exporter.record
+
+	// Remove The first record from the internal store CacheManager to trigger an ErrNotFound
+	delete(store.byID[internal.getID(record.key)].results, record.ID)
+	_, err = exporter.ExportTo(ctx, expTarget, testExporterOpts(true))
+
+	require.NoError(t, err)
+}
+
 func TestCacheLoadError(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	cacheManager := newTrackingCacheManager(NewInMemoryCacheManager())
 
@@ -3310,7 +3411,7 @@ func TestCacheLoadError(t *testing.T) {
 
 func TestInputRequestDeadlock(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -3449,7 +3550,7 @@ func TestUnknownBuildID(t *testing.T) {
 func TestStaleEdgeMerge(t *testing.T) {
 	// should not be possible to merge to an edge no longer in the actives map
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	s := NewSolver(SolverOpt{
 		ResolveOpFunc: testOpResolver,
@@ -3586,10 +3687,7 @@ func generateSubGraph(nodes int) (Edge, int) {
 		return Edge{Vertex: vtxConst(value, vtxOpt{})}, value
 	}
 	spread := rand.Int()%5 + 2 //nolint:gosec
-	inc := int(math.Ceil(float64(nodes) / float64(spread)))
-	if inc > nodes {
-		inc = nodes
-	}
+	inc := min(int(math.Ceil(float64(nodes)/float64(spread))), nodes)
 	added := 1
 	value := 0
 	inputs := []Edge{}
@@ -3622,6 +3720,7 @@ type vtxOpt struct {
 	execPreFunc      func(context.Context) error
 	inputs           []Edge
 	value            string
+	result           Result
 	slowCacheCompute map[int]ResultBasedCacheFunc
 	selectors        map[int]digest.Digest
 	cacheSource      CacheManager
@@ -3645,10 +3744,12 @@ type vertex struct {
 	execCallCount  *int64
 }
 
+var _ Op = &vertex{}
+
 func (v *vertex) Digest() digest.Digest {
 	return digest.FromBytes([]byte(v.opt.name))
 }
-func (v *vertex) Sys() interface{} {
+func (v *vertex) Sys() any {
 	return v
 }
 func (v *vertex) Inputs() []Edge {
@@ -3719,7 +3820,7 @@ func (v *vertex) cacheMap(ctx context.Context) error {
 	return nil
 }
 
-func (v *vertex) CacheMap(ctx context.Context, g session.Group, index int) (*CacheMap, bool, error) {
+func (v *vertex) CacheMap(ctx context.Context, jobCtx JobContext, index int) (*CacheMap, bool, error) {
 	if index == 0 {
 		if err := v.cacheMap(ctx); err != nil {
 			return nil, false, err
@@ -3727,13 +3828,13 @@ func (v *vertex) CacheMap(ctx context.Context, g session.Group, index int) (*Cac
 		return v.makeCacheMap(), len(v.opt.cacheKeySeeds) == index, nil
 	}
 	return &CacheMap{
-		Digest: digest.FromBytes([]byte(fmt.Sprintf("seed:%s", v.opt.cacheKeySeeds[index-1]()))),
+		Digest: digest.FromBytes(fmt.Appendf(nil, "seed:%s", v.opt.cacheKeySeeds[index-1]())),
 	}, len(v.opt.cacheKeySeeds) == index, nil
 }
 
 func (v *vertex) exec(ctx context.Context, inputs []Result) error {
 	if len(inputs) != len(v.Inputs()) {
-		return errors.Errorf("invalid number of inputs")
+		return errors.New("invalid number of inputs")
 	}
 	if f := v.opt.execPreFunc; f != nil {
 		if err := f(ctx); err != nil {
@@ -3756,9 +3857,12 @@ func (v *vertex) exec(ctx context.Context, inputs []Result) error {
 	return nil
 }
 
-func (v *vertex) Exec(ctx context.Context, g session.Group, inputs []Result) (outputs []Result, err error) {
+func (v *vertex) Exec(ctx context.Context, job JobContext, inputs []Result) (outputs []Result, err error) {
 	if err := v.exec(ctx, inputs); err != nil {
 		return nil, err
+	}
+	if v.opt.result != nil {
+		return []Result{v.opt.result}, nil
 	}
 	return []Result{&dummyResult{id: identity.NewID(), value: v.opt.value}}, nil
 }
@@ -3769,7 +3873,7 @@ func (v *vertex) Acquire(ctx context.Context) (ReleaseFunc, error) {
 
 func (v *vertex) makeCacheMap() *CacheMap {
 	m := &CacheMap{
-		Digest: digest.FromBytes([]byte(fmt.Sprintf("seed:%s", v.opt.cacheKeySeed))),
+		Digest: digest.FromBytes(fmt.Appendf(nil, "seed:%s", v.opt.cacheKeySeed)),
 		Deps: make([]struct {
 			Selector          digest.Digest
 			ComputeDigestFunc ResultBasedCacheFunc
@@ -3801,11 +3905,13 @@ type vertexConst struct {
 	value int
 }
 
-func (v *vertexConst) Sys() interface{} {
+var _ Op = &vertexConst{}
+
+func (v *vertexConst) Sys() any {
 	return v
 }
 
-func (v *vertexConst) Exec(ctx context.Context, g session.Group, inputs []Result) (outputs []Result, err error) {
+func (v *vertexConst) Exec(ctx context.Context, jobCtx JobContext, inputs []Result) (outputs []Result, err error) {
 	if err := v.exec(ctx, inputs); err != nil {
 		return nil, err
 	}
@@ -3832,11 +3938,13 @@ type vertexSum struct {
 	value int
 }
 
-func (v *vertexSum) Sys() interface{} {
+var _ Op = &vertexSum{}
+
+func (v *vertexSum) Sys() any {
 	return v
 }
 
-func (v *vertexSum) Exec(ctx context.Context, g session.Group, inputs []Result) (outputs []Result, err error) {
+func (v *vertexSum) Exec(ctx context.Context, jobCtx JobContext, inputs []Result) (outputs []Result, err error) {
 	if err := v.exec(ctx, inputs); err != nil {
 		return nil, err
 	}
@@ -3871,11 +3979,13 @@ type vertexAdd struct {
 	value int
 }
 
-func (v *vertexAdd) Sys() interface{} {
+var _ Op = &vertexAdd{}
+
+func (v *vertexAdd) Sys() any {
 	return v
 }
 
-func (v *vertexAdd) Exec(ctx context.Context, g session.Group, inputs []Result) (outputs []Result, err error) {
+func (v *vertexAdd) Exec(ctx context.Context, jobCtx JobContext, inputs []Result) (outputs []Result, err error) {
 	if err := v.exec(ctx, inputs); err != nil {
 		return nil, err
 	}
@@ -3909,11 +4019,13 @@ type vertexSubBuild struct {
 	b Builder
 }
 
-func (v *vertexSubBuild) Sys() interface{} {
+var _ Op = &vertexSubBuild{}
+
+func (v *vertexSubBuild) Sys() any {
 	return v
 }
 
-func (v *vertexSubBuild) Exec(ctx context.Context, g session.Group, inputs []Result) (outputs []Result, err error) {
+func (v *vertexSubBuild) Exec(ctx context.Context, jobCtx JobContext, inputs []Result) (outputs []Result, err error) {
 	if err := v.exec(ctx, inputs); err != nil {
 		return nil, err
 	}
@@ -3928,12 +4040,11 @@ func (v *vertexSubBuild) Acquire(ctx context.Context) (ReleaseFunc, error) {
 	return func() {}, nil
 }
 
-//nolint:unused
-func printGraph(e Edge, pfx string) {
+func PrintGraph(e Edge, pfx string) {
 	name := e.Vertex.Name()
 	fmt.Printf("%s %d %s\n", pfx, e.Index, name)
 	for _, inp := range e.Vertex.Inputs() {
-		printGraph(inp, pfx+"-->")
+		PrintGraph(inp, pfx+"-->")
 	}
 }
 
@@ -3945,8 +4056,30 @@ type dummyResult struct {
 
 func (r *dummyResult) ID() string                    { return r.id }
 func (r *dummyResult) Release(context.Context) error { return nil }
-func (r *dummyResult) Sys() interface{}              { return r }
+func (r *dummyResult) Sys() any                      { return r }
 func (r *dummyResult) Clone() Result                 { return r }
+
+type countedResult struct {
+	id           string
+	value        string
+	releaseCount *atomic.Int64
+}
+
+func (r *countedResult) ID() string { return r.id }
+func (r *countedResult) Release(context.Context) error {
+	if r.releaseCount != nil {
+		r.releaseCount.Add(1)
+	}
+	return nil
+}
+func (r *countedResult) Sys() any { return &dummyResult{id: r.id, value: r.value} }
+func (r *countedResult) Clone() Result {
+	return &countedResult{
+		id:           r.id,
+		value:        r.value,
+		releaseCount: r.releaseCount,
+	}
+}
 
 func testOpResolver(v Vertex, b Builder) (Op, error) {
 	if op, ok := v.Sys().(Op); ok {
@@ -3956,7 +4089,7 @@ func testOpResolver(v Vertex, b Builder) (Op, error) {
 		return op, nil
 	}
 
-	return nil, errors.Errorf("invalid vertex")
+	return nil, errors.New("invalid vertex")
 }
 
 func unwrap(res Result) string {
@@ -4000,7 +4133,7 @@ type trackingCacheManager struct {
 func (cm *trackingCacheManager) Load(ctx context.Context, rec *CacheRecord) (Result, error) {
 	atomic.AddInt64(&cm.loadCounter, 1)
 	if cm.forceFail {
-		return nil, errors.Errorf("force fail")
+		return nil, errors.New("force fail")
 	}
 	return cm.CacheManager.Load(ctx, rec)
 }
@@ -4029,66 +4162,32 @@ func testExporterOpts(all bool) CacheExportOpt {
 
 func newTestExporterTarget() *testExporterTarget {
 	return &testExporterTarget{
-		visited: map[interface{}]struct{}{},
+		visited: map[any]struct{}{},
 	}
 }
 
 type testExporterTarget struct {
-	visited map[interface{}]struct{}
+	visited map[any]struct{}
 	records []*testExporterRecord
 }
 
-func (t *testExporterTarget) Add(dgst digest.Digest) CacheExporterRecord {
-	r := &testExporterRecord{dgst: dgst}
-	t.records = append(t.records, r)
-	return r
-}
-
-func (t *testExporterTarget) Visit(v interface{}) {
-	t.visited[v] = struct{}{}
-}
-
-func (t *testExporterTarget) Visited(v interface{}) bool {
-	_, ok := t.visited[v]
-	return ok
-}
-
-func (t *testExporterTarget) normalize() {
-	m := map[digest.Digest]struct{}{}
-	rec := make([]*testExporterRecord, 0, len(t.records))
+func (t *testExporterTarget) numUniqueRecords() int {
+	unique := make(map[digest.Digest]struct{})
 	for _, r := range t.records {
-		if _, ok := m[r.dgst]; ok {
-			for _, r2 := range t.records {
-				delete(r2.linkMap, r.dgst)
-				r2.links = len(r2.linkMap)
-			}
-			continue
-		}
-		m[r.dgst] = struct{}{}
-		rec = append(rec, r)
+		unique[r.dgst] = struct{}{}
 	}
-	t.records = rec
+	return len(unique)
+}
+
+func (t *testExporterTarget) Add(dgst digest.Digest, links [][]CacheLink, results []CacheExportResult) (CacheExporterRecord, bool, error) {
+	r := &testExporterRecord{dgst: dgst, results: len(results), links: len(links)}
+	t.records = append(t.records, r)
+	return r, true, nil
 }
 
 type testExporterRecord struct {
+	CacheExporterRecordBase
 	dgst    digest.Digest
 	results int
 	links   int
-	linkMap map[digest.Digest]struct{}
-}
-
-func (r *testExporterRecord) AddResult(_ digest.Digest, _ int, createdAt time.Time, result *Remote) {
-	r.results++
-}
-
-func (r *testExporterRecord) LinkFrom(src CacheExporterRecord, index int, selector string) {
-	if s, ok := src.(*testExporterRecord); ok {
-		if r.linkMap == nil {
-			r.linkMap = map[digest.Digest]struct{}{}
-		}
-		if _, ok := r.linkMap[s.dgst]; !ok {
-			r.linkMap[s.dgst] = struct{}{}
-			r.links++
-		}
-	}
 }

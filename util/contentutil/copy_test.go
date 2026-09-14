@@ -2,10 +2,9 @@ package contentutil
 
 import (
 	"bytes"
-	"context"
 	"testing"
 
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
@@ -13,7 +12,7 @@ import (
 
 func TestCopy(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b0 := NewBuffer()
 	b1 := NewBuffer()

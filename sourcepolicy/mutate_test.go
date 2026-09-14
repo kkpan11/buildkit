@@ -1,12 +1,12 @@
 package sourcepolicy
 
 import (
-	"context"
 	"testing"
 
 	"github.com/moby/buildkit/solver/pb"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestMutate(t *testing.T) {
@@ -124,17 +124,17 @@ func TestMutate(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
-		op := *tc.op
+		op := tc.op
 		t.Run(op.String(), func(t *testing.T) {
 			src := op.GetSource()
-			mutated, err := mutate(ctx, src, tc.rule, &selectorCache{Selector: tc.rule.Selector}, src.GetIdentifier())
+			mutated, err := mutate(ctx, src, tc.rule, newSelectorCache(tc.rule.Selector), src.GetIdentifier())
 			require.Equal(t, tc.expected, mutated)
 			if tc.expectedErr != "" {
 				require.Error(t, err, tc.expectedErr)
 			} else {
-				require.Equal(t, tc.expectedOp, &op)
+				require.True(t, proto.Equal(tc.expectedOp, op))
 			}
 		})
 	}

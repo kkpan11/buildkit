@@ -1,12 +1,17 @@
 package ops
 
 import (
-	"context"
+	"bytes"
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/network"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,6 +36,29 @@ func TestDedupePaths(t *testing.T) {
 
 	res = dedupePaths([]string{"/", "/foo"})
 	require.Equal(t, []string{"/"}, res)
+}
+
+func TestLogProxyRequests(t *testing.T) {
+	var buf bytes.Buffer
+	logProxyRequests(&buf, []network.ProxyRequest{
+		{Method: "GET", URL: "https://example.com/file", StatusCode: http.StatusOK},
+		{Method: "POST", URL: "https://xxxxx:xxxxx@example.com/token", StatusCode: http.StatusCreated},
+		{Method: "GET", URL: "https://example.com/unknown-status"},
+	})
+
+	require.Equal(t, strings.Join([]string{
+		"proxy network requests:",
+		"- GET https://example.com/file -> 200",
+		"- POST https://xxxxx:xxxxx@example.com/token -> 201",
+		"- GET https://example.com/unknown-status",
+		"",
+	}, "\n"), buf.String())
+}
+
+func TestLogProxyRequestsEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	logProxyRequests(&buf, nil)
+	require.Empty(t, buf.String())
 }
 
 func TestExecOpCacheMap(t *testing.T) {
@@ -105,17 +133,16 @@ func TestExecOpCacheMap(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			m1, ok, err := tc.op1.CacheMap(ctx, session.NewGroup(t.Name()), 1)
+			m1, ok, err := tc.op1.CacheMap(ctx, testJobContext(t), 1)
 			require.NoError(t, err)
 			require.True(t, ok)
 
-			m2, ok, err := tc.op2.CacheMap(ctx, session.NewGroup(t.Name()), 1)
+			m2, ok, err := tc.op2.CacheMap(ctx, testJobContext(t), 1)
 			require.NoError(t, err)
 			require.True(t, ok)
 
@@ -190,14 +217,13 @@ func TestExecOpContentCache(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			// default is always valid, and can sometimes have slow-cache
-			m, ok, err := tc.op.CacheMap(ctx, session.NewGroup(t.Name()), 1)
+			m, ok, err := tc.op.CacheMap(ctx, testJobContext(t), 1)
 			require.NoError(t, err)
 			require.True(t, ok)
 			for _, dep := range m.Deps {
@@ -212,7 +238,7 @@ func TestExecOpContentCache(t *testing.T) {
 			for _, mnt := range tc.op.op.Mounts {
 				mnt.ContentCache = pb.MountContentCache_OFF
 			}
-			m, ok, err = tc.op.CacheMap(ctx, session.NewGroup(t.Name()), 1)
+			m, ok, err = tc.op.CacheMap(ctx, testJobContext(t), 1)
 			require.NoError(t, err)
 			require.True(t, ok)
 			for _, dep := range m.Deps {
@@ -223,7 +249,7 @@ func TestExecOpContentCache(t *testing.T) {
 			for _, mnt := range tc.op.op.Mounts {
 				mnt.ContentCache = pb.MountContentCache_ON
 			}
-			m, ok, err = tc.op.CacheMap(ctx, session.NewGroup(t.Name()), 1)
+			m, ok, err = tc.op.CacheMap(ctx, testJobContext(t), 1)
 			if tc.cacheIsSafe {
 				require.NoError(t, err)
 				require.True(t, ok)
@@ -254,7 +280,7 @@ func withNewMount(p string, opts ...func(*pb.Mount)) func(*ExecOp) {
 	return func(op *ExecOp) {
 		m := &pb.Mount{
 			Dest:  p,
-			Input: pb.InputIndex(op.numInputs),
+			Input: int64(op.numInputs),
 			// Generate a new selector for each mount since this should not effect the cache key.
 			// This helps exercise that code path.
 			Selector: identity.NewID(),
@@ -288,6 +314,30 @@ func withReadonly() func(*pb.Mount) {
 
 func withoutOutput() func(*pb.Mount) {
 	return func(m *pb.Mount) {
-		m.Output = pb.SkipOutput
+		m.Output = int64(pb.SkipOutput)
 	}
+}
+
+func testJobContext(t *testing.T) solver.JobContext {
+	return &jobCtx{g: session.NewGroup(t.Name())}
+}
+
+type jobCtx struct {
+	g session.Group
+}
+
+func (j *jobCtx) Session() session.Group {
+	return j.g
+}
+
+func (j *jobCtx) Cleanup(f func() error) error {
+	return errors.Errorf("cleanup not implemented for %T", j)
+}
+
+func (j *jobCtx) ResolverCache() solver.ResolverCache {
+	return nil
+}
+
+func (j *jobCtx) CompatibilityVersion() (int, error) {
+	return 0, nil
 }

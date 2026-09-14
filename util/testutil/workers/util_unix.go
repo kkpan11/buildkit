@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package workers
 
@@ -13,6 +12,8 @@ import (
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/pkg/errors"
 )
+
+const buildkitdNetworkProtocol = "unix"
 
 func applyBuildkitdPlatformFlags(args []string) []string {
 	return append(args, "--oci-worker=false")
@@ -33,6 +34,10 @@ func getSysProcAttr() *syscall.SysProcAttr {
 
 func getBuildkitdAddr(tmpdir string) string {
 	return "unix://" + filepath.Join(tmpdir, "buildkitd.sock")
+}
+
+func getBuildkitdDebugAddr(tmpdir string) string {
+	return "unix://" + filepath.Join(tmpdir, "buildkitd-debug.sock")
 }
 
 func getTraceSocketPath(tmpdir string) string {
@@ -71,4 +76,13 @@ func chown(name string, uid, gid int) error {
 func normalizeAddress(address string) string {
 	// for parity with windows, no effect for unix
 	return address
+}
+
+func applyDockerdPlatformFlags(flags []string, _ string) []string {
+	flags = append(flags, "--userland-proxy=false")
+	return flags
+}
+
+func getBuildkitdNetworkAddr(tmpdir string) string {
+	return tmpdir
 }

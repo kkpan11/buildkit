@@ -1,4 +1,12 @@
+variable "EXPORT_BASE" {
+  default = null
+}
+
 variable "ALPINE_VERSION" {
+  default = null
+}
+
+variable "UBUNTU_VERSION" {
   default = null
 }
 
@@ -11,6 +19,10 @@ variable "NODE_VERSION" {
 }
 
 variable "BUILDKITD_TAGS" {
+  default = null
+}
+
+variable "BUILDKIT_DEBUG" {
   default = null
 }
 
@@ -42,6 +54,22 @@ variable "GOLANGCI_LINT_MULTIPLATFORM" {
   default = null
 }
 
+variable "ARCHUTIL_MULTIPLATFORM" {
+  default = null
+}
+
+variable "IMAGE_TARGET" {
+  default = null
+}
+
+variable "FRONTEND_CHANNEL" {
+  default = "mainline"
+}
+
+variable "FRONTEND_BUILDTAGS" {
+  default = null
+}
+
 # Defines the output folder
 variable "DESTDIR" {
   default = ""
@@ -51,17 +79,46 @@ variable "TEST_COVERAGE" {
   default = null
 }
 
+variable "TEST_IMAGE_NAME" {
+  default = "buildkit-tests"
+}
+
+variable "TEST_CONTEXT" {
+  default = "."
+  description = "Context for building the test image"
+}
+
+variable "TEST_BINARIES_CONTEXT" {
+  default = TEST_CONTEXT
+  description = "Context for building the buildkitd for test image"
+}
+
+variable "BUILDKIT_SYNTAX" {
+  default = null
+}
+
 function "bindir" {
   params = [defaultdir]
   result = DESTDIR != "" ? DESTDIR : "./bin/${defaultdir}"
 }
 
+# Special target: https://github.com/docker/metadata-action#bake-definition
+target "meta-helper" {
+  tags = [IMAGE_TARGET != null && IMAGE_TARGET != "" ? "moby/buildkit:local-${IMAGE_TARGET}" : "moby/buildkit:local"]
+}
+target "frontend-meta-helper" {
+  tags = [FRONTEND_CHANNEL != null && FRONTEND_CHANNEL != "" && FRONTEND_CHANNEL != "mainline" ? "docker/dockerfile:local-${FRONTEND_CHANNEL}" : "docker/dockerfile:local"]
+}
+
 target "_common" {
   args = {
+    EXPORT_BASE = EXPORT_BASE
     ALPINE_VERSION = ALPINE_VERSION
+    UBUNTU_VERSION = UBUNTU_VERSION
     GO_VERSION = GO_VERSION
     NODE_VERSION = NODE_VERSION
     BUILDKITD_TAGS = BUILDKITD_TAGS
+    BUILDKIT_DEBUG = BUILDKIT_DEBUG
     HTTP_PROXY = HTTP_PROXY
     HTTPS_PROXY = HTTPS_PROXY
     NO_PROXY = NO_PROXY
@@ -111,22 +168,84 @@ target "release" {
   output = [bindir("release")]
 }
 
+target "image" {
+  inherits = ["_common", "meta-helper"]
+  target = IMAGE_TARGET
+  cache-to = ["type=inline"]
+  output = ["type=docker"]
+}
+
+target "image-cross" {
+  inherits = ["image"]
+  output = ["type=image,oci-artifact=true"]
+  platforms = [
+    "linux/amd64",
+    "linux/arm/v7",
+    "linux/arm64",
+    "linux/s390x",
+    "linux/ppc64le",
+    "linux/riscv64"
+  ]
+}
+
+target "frontend-image" {
+  inherits = ["_common", "frontend-meta-helper"]
+  dockerfile = "./frontend/dockerfile/cmd/dockerfile-frontend/Dockerfile"
+  args = {
+    CHANNEL = FRONTEND_CHANNEL
+    BUILDTAGS = FRONTEND_BUILDTAGS
+  }
+  output = ["type=docker"]
+}
+
+target "frontend-image-cross" {
+  inherits = ["frontend-image"]
+  output = ["type=image,oci-artifact=true"]
+  platforms = [
+    "linux/386",
+    "linux/amd64",
+    "linux/arm/v7",
+    "linux/arm64",
+    "linux/mips",
+    "linux/mipsle",
+    "linux/mips64",
+    "linux/mips64le",
+    "linux/s390x",
+    "linux/ppc64le",
+    "linux/riscv64"
+  ]
+}
+
 target "integration-tests-base" {
   inherits = ["_common"]
   target = "integration-tests-base"
   output = ["type=cacheonly"]
 }
 
+target "integration-tests-binaries" {
+  inherits = ["_common"]
+  target = "binaries"
+  context = TEST_BINARIES_CONTEXT
+}
+
 target "integration-tests" {
   inherits = ["integration-tests-base"]
   target = "integration-tests"
+  context = TEST_CONTEXT
+  contexts = TEST_CONTEXT != TEST_BINARIES_CONTEXT ? {
+    "binaries" = "target:integration-tests-binaries"
+  } : null
   args = {
     GOBUILDFLAGS = TEST_COVERAGE == "1" ? "-cover" : null
+    BUILDKIT_SYNTAX = BUILDKIT_SYNTAX
   }
+  output = [
+    "type=docker,name=${TEST_IMAGE_NAME}",
+  ]
 }
 
 group "validate" {
-  targets = ["lint", "validate-vendor", "validate-doctoc", "validate-generated-files", "validate-archutil", "validate-shfmt", "validate-docs", "validate-docs-dockerfile"]
+  targets = ["lint", "validate-vendor", "validate-doctoc", "validate-dockerfile", "validate-generated-files", "validate-archutil", "validate-shfmt", "validate-docs", "validate-docs-dockerfile"]
 }
 
 target "lint" {
@@ -138,6 +257,7 @@ target "lint" {
   args = {
     TARGETNAME = buildtags.name
     BUILDTAGS = buildtags.tags
+    GOLANGCI_FROM_SOURCE = "true"
   }
   platforms = ( buildtags.target == "golangci-lint" || buildtags.name == "gopls" ) && GOLANGCI_LINT_MULTIPLATFORM != null ? [
     "freebsd/amd64",
@@ -152,7 +272,7 @@ target "lint" {
   matrix = {
     buildtags = [
       { name = "default", tags = "", target = "golangci-lint" },
-      { name = "labs", tags = "dfrunsecurity dfparents dfexcludepatterns", target = "golangci-lint" },
+      { name = "labs", tags = "", target = "golangci-lint" },
       { name = "nydus", tags = "nydus", target = "golangci-lint" },
       { name = "yaml", tags = "", target = "yamllint" },
       { name = "golangci-verify", tags = "", target = "golangci-verify" },
@@ -160,6 +280,13 @@ target "lint" {
       { name = "gopls", tags = "", target = "gopls-analyze" }
     ]
   }
+}
+
+target "modernize-fix" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/lint.Dockerfile"
+  target = "modernize-fix"
+  output = ["."]
 }
 
 target "validate-vendor" {
@@ -181,6 +308,10 @@ target "validate-archutil" {
   dockerfile = "./hack/dockerfiles/archutil.Dockerfile"
   target = "validate"
   output = ["type=cacheonly"]
+  platforms = ARCHUTIL_MULTIPLATFORM != null ? [
+    "linux/amd64",
+    "linux/arm64"
+  ] : []
 }
 
 target "validate-shfmt" {
@@ -216,6 +347,29 @@ target "validate-docs-dockerfile" {
   dockerfile = "./hack/dockerfiles/docs-dockerfile.Dockerfile"
   target = "validate"
   output = ["type=cacheonly"]
+}
+
+target "validate-dockerfile" {
+  matrix = {
+    dockerfile = [
+      "Dockerfile",
+      "./hack/dockerfiles/archutil.Dockerfile",
+      "./hack/dockerfiles/authors.Dockerfile",
+      "./hack/dockerfiles/docs-dockerfile.Dockerfile",
+      "./hack/dockerfiles/docs.Dockerfile",
+      "./hack/dockerfiles/doctoc.Dockerfile",
+      "./hack/dockerfiles/generated-files.Dockerfile",
+      "./hack/dockerfiles/govulncheck.Dockerfile",
+      "./hack/dockerfiles/lint.Dockerfile",
+      "./hack/dockerfiles/shfmt.Dockerfile",
+      "./hack/dockerfiles/vendor.Dockerfile",
+      "./frontend/dockerfile/cmd/dockerfile-frontend/Dockerfile",
+    ]
+  }
+  name = "validate-dockerfile-${md5(dockerfile)}"
+  inherits = ["_common"]
+  dockerfile = dockerfile
+  call = "check"
 }
 
 target "vendor" {
@@ -274,10 +428,25 @@ target "docs-dockerfile" {
   output = ["./frontend/dockerfile/docs/rules"]
 }
 
-target "mod-outdated" {
+target "gomod-updates" {
   inherits = ["_common"]
   dockerfile = "./hack/dockerfiles/vendor.Dockerfile"
-  target = "outdated"
-  no-cache-filter = ["outdated"]
+  target = "gomod-updates"
+  no-cache-filter = ["gomod-updates"]
   output = ["type=cacheonly"]
+}
+
+variable "GOVULNCHECK_FORMAT" {
+  default = null
+}
+
+target "govulncheck" {
+  inherits = ["_common"]
+  dockerfile = "./hack/dockerfiles/govulncheck.Dockerfile"
+  target = "output"
+  args = {
+    FORMAT = GOVULNCHECK_FORMAT
+  }
+  no-cache-filter = ["run"]
+  output = ["${DESTDIR}"]
 }

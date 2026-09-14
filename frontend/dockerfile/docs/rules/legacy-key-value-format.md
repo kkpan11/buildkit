@@ -1,6 +1,7 @@
 ---
 title: LegacyKeyValueFormat
-description: Legacy key/value format with whitespace separator should not be used
+description: >-
+  Legacy key/value format with whitespace separator should not be used
 aliases:
   - /go/dockerfile/rule/legacy-key-value-format/
 ---
@@ -53,4 +54,19 @@ ENV DEPS="\
     git \
     make"
 ```
+
+> [!NOTE]
+> Be aware of leading whitespace when converting multi-line legacy syntax to
+> the modern `key=value` format. In the legacy format, leading whitespace on
+> continuation lines is included in the value. In the modern format with
+> quoted values, leading whitespace inside the quotes is also preserved. If
+> you don't want leading whitespace in the value, make sure to remove it when
+> rewriting to the new format:
+>
+> ```dockerfile
+> ENV DEPS="\
+> curl \
+> git \
+> make"
+> ```
 

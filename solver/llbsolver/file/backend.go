@@ -5,16 +5,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
 	"github.com/containerd/continuity/fs"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/llbsolver/ops/fileoptypes"
 	"github.com/moby/buildkit/solver/pb"
-	"github.com/moby/buildkit/util/system"
+	"github.com/moby/sys/user"
 	"github.com/pkg/errors"
 	copy "github.com/tonistiigi/fsutil/copy"
 )
@@ -27,10 +25,17 @@ func timestampToTime(ts int64) *time.Time {
 	return &tm
 }
 
-func mkdir(d string, action pb.FileActionMkDir, user *copy.User, idmap *idtools.IdentityMapping) error {
+func mkdir(d string, action *pb.FileActionMkDir, user *copy.User, idmap *user.IdentityMapping) (err error) {
+	defer func() {
+		var osErr *os.PathError
+		if errors.As(err, &osErr) {
+			osErr.Path = strings.TrimPrefix(osErr.Path, d)
+		}
+	}()
+
 	p, err := fs.RootPath(d, action.Path)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	ch, err := mapUserToChowner(user, idmap)
@@ -39,7 +44,7 @@ func mkdir(d string, action pb.FileActionMkDir, user *copy.User, idmap *idtools.
 	}
 
 	if action.MakeParents {
-		if err := copy.MkdirAll(p, os.FileMode(action.Mode)&0777, ch, timestampToTime(action.Timestamp)); err != nil {
+		if _, err := copy.MkdirAll(p, os.FileMode(action.Mode)&0777, ch, timestampToTime(action.Timestamp)); err != nil {
 			return err
 		}
 	} else {
@@ -47,23 +52,65 @@ func mkdir(d string, action pb.FileActionMkDir, user *copy.User, idmap *idtools.
 			if errors.Is(err, os.ErrExist) {
 				return nil
 			}
-			return err
+			return errors.WithStack(err)
 		}
 		if err := copy.Chown(p, nil, ch); err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 		if err := copy.Utimes(p, timestampToTime(action.Timestamp)); err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 	}
 
 	return nil
 }
 
-func mkfile(d string, action pb.FileActionMkFile, user *copy.User, idmap *idtools.IdentityMapping) error {
-	p, err := fs.RootPath(d, filepath.Join("/", action.Path))
+func symlink(d string, action *pb.FileActionSymlink, user *copy.User, idmap *user.IdentityMapping) (err error) {
+	defer func() {
+		var osErr *os.PathError
+		if errors.As(err, &osErr) {
+			// remove system root from error path if present
+			osErr.Path = strings.TrimPrefix(osErr.Path, d)
+		}
+	}()
+
+	newpath, err := fs.RootPath(d, filepath.Join("/", action.Newpath))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	ch, err := mapUserToChowner(user, idmap)
 	if err != nil {
 		return err
+	}
+
+	if err := os.Symlink(action.Oldpath, newpath); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := copy.Chown(newpath, nil, ch); err != nil {
+		return errors.WithStack(err)
+	}
+
+	if err := copy.Utimes(newpath, timestampToTime(action.Timestamp)); err != nil {
+		return errors.WithStack(err)
+	}
+
+	return nil
+}
+
+func mkfile(d string, action *pb.FileActionMkFile, user *copy.User, idmap *user.IdentityMapping) (err error) {
+	defer func() {
+		var osErr *os.PathError
+		if errors.As(err, &osErr) {
+			// remove system root from error path if present
+			osErr.Path = strings.TrimPrefix(osErr.Path, d)
+		}
+	}()
+
+	p, err := fs.RootPath(d, filepath.Join("/", action.Path))
+	if err != nil {
+		return errors.WithStack(err)
 	}
 
 	ch, err := mapUserToChowner(user, idmap)
@@ -72,29 +119,34 @@ func mkfile(d string, action pb.FileActionMkFile, user *copy.User, idmap *idtool
 	}
 
 	if err := os.WriteFile(p, action.Data, os.FileMode(action.Mode)&0777); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	if err := copy.Chown(p, nil, ch); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	if err := copy.Utimes(p, timestampToTime(action.Timestamp)); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 
 	return nil
 }
 
-func rm(d string, action pb.FileActionRm) error {
-	if action.AllowWildcard {
-		src, err := cleanPath(action.Path)
-		if err != nil {
-			return errors.Wrap(err, "cleaning path")
+func rm(d string, action *pb.FileActionRm) (err error) {
+	defer func() {
+		var osErr *os.PathError
+		if errors.As(err, &osErr) {
+			// remove system root from error path if present
+			osErr.Path = strings.TrimPrefix(osErr.Path, d)
 		}
+	}()
+
+	if action.AllowWildcard {
+		src := cleanPath(action.Path)
 		m, err := copy.ResolveWildcards(d, src, false)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 
 		for _, s := range m {
@@ -110,14 +162,14 @@ func rm(d string, action pb.FileActionRm) error {
 }
 
 func rmPath(root, src string, allowNotFound bool) error {
-	src = filepath.Clean(src)
+	src = filepath.Join("/", src)
 	dir, base := filepath.Split(src)
 	if base == "" {
 		return errors.New("rmPath: invalid empty path")
 	}
-	dir, err := fs.RootPath(root, filepath.Join("/", dir))
+	dir, err := fs.RootPath(root, dir)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	p := filepath.Join(dir, base)
 
@@ -125,26 +177,21 @@ func rmPath(root, src string, allowNotFound bool) error {
 		_, err := os.Stat(p)
 
 		if errors.Is(err, os.ErrNotExist) {
-			return err
+			return errors.WithStack(err)
 		}
 	}
 
-	return os.RemoveAll(p)
+	return errors.WithStack(os.RemoveAll(p))
 }
 
-func docopy(ctx context.Context, src, dest string, action pb.FileActionCopy, u *copy.User, idmap *idtools.IdentityMapping) error {
-	srcPath, err := cleanPath(action.Src)
-	if err != nil {
-		return errors.Wrap(err, "cleaning source path")
-	}
-	destPath, err := cleanPath(action.Dest)
-	if err != nil {
-		return errors.Wrap(err, "cleaning destination path")
-	}
+func docopy(ctx context.Context, src, dest string, action *pb.FileActionCopy, u *copy.User, idmap *user.IdentityMapping) (err error) {
+	srcPath := cleanPath(action.Src)
+	destPath := cleanPath(action.Dest)
+
 	if !action.CreateDestPath {
 		p, err := fs.RootPath(dest, filepath.Join("/", action.Dest))
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 		if _, err := os.Lstat(filepath.Dir(p)); err != nil {
 			return errors.Wrapf(err, "failed to stat %s", action.Dest)
@@ -167,7 +214,9 @@ func docopy(ctx context.Context, src, dest string, action pb.FileActionCopy, u *
 			ci.ExcludePatterns = action.ExcludePatterns
 			ci.Chown = ch
 			ci.Utime = timestampToTime(action.Timestamp)
-			if m := int(action.Mode); m != -1 {
+			if action.ModeStr != "" {
+				ci.ModeStr = action.ModeStr
+			} else if m := int(action.Mode); m != -1 {
 				ci.Mode = &m
 			}
 			ci.CopyDirContents = action.DirCopyContents
@@ -177,6 +226,15 @@ func docopy(ctx context.Context, src, dest string, action pb.FileActionCopy, u *
 		copy.WithXAttrErrorHandler(xattrErrorHandler),
 	}
 
+	defer func() {
+		var osErr *os.PathError
+		if errors.As(err, &osErr) {
+			// remove system root from error path if present
+			osErr.Path = strings.TrimPrefix(osErr.Path, src)
+			osErr.Path = strings.TrimPrefix(osErr.Path, dest)
+		}
+	}()
+
 	var m []string
 	if !action.AllowWildcard {
 		m = []string{srcPath}
@@ -184,7 +242,7 @@ func docopy(ctx context.Context, src, dest string, action pb.FileActionCopy, u *
 		var err error
 		m, err = copy.ResolveWildcards(src, srcPath, action.FollowSymlink)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 
 		if len(m) == 0 {
@@ -197,14 +255,14 @@ func docopy(ctx context.Context, src, dest string, action pb.FileActionCopy, u *
 
 	for _, s := range m {
 		if action.AttemptUnpackDockerCompatibility {
-			if ok, err := unpack(src, s, dest, destPath, ch, timestampToTime(action.Timestamp), idmap); err != nil {
-				return err
+			if ok, err := unpack(src, s, dest, destPath, ch, u, timestampToTime(action.Timestamp), idmap); err != nil {
+				return errors.WithStack(err)
 			} else if ok {
 				continue
 			}
 		}
-		if err := copy.Copy(ctx, src, s, dest, destPath, opt...); err != nil {
-			return err
+		if err := platformCopy(ctx, src, s, dest, destPath, opt...); err != nil {
+			return errors.WithStack(err)
 		}
 	}
 
@@ -228,7 +286,7 @@ type Backend struct {
 	readUser ReadUserCallback
 }
 
-func (fb *Backend) Mkdir(ctx context.Context, m, user, group fileoptypes.Mount, action pb.FileActionMkDir) error {
+func (fb *Backend) Mkdir(ctx context.Context, m, user, group fileoptypes.Mount, action *pb.FileActionMkDir) error {
 	mnt, ok := m.(*Mount)
 	if !ok {
 		return errors.Errorf("invalid mount type %T", m)
@@ -249,7 +307,7 @@ func (fb *Backend) Mkdir(ctx context.Context, m, user, group fileoptypes.Mount, 
 	return mkdir(dir, action, u, mnt.m.IdentityMapping())
 }
 
-func (fb *Backend) Mkfile(ctx context.Context, m, user, group fileoptypes.Mount, action pb.FileActionMkFile) error {
+func (fb *Backend) Mkfile(ctx context.Context, m, user, group fileoptypes.Mount, action *pb.FileActionMkFile) error {
 	mnt, ok := m.(*Mount)
 	if !ok {
 		return errors.Errorf("invalid mount type %T", m)
@@ -270,7 +328,28 @@ func (fb *Backend) Mkfile(ctx context.Context, m, user, group fileoptypes.Mount,
 	return mkfile(dir, action, u, mnt.m.IdentityMapping())
 }
 
-func (fb *Backend) Rm(ctx context.Context, m fileoptypes.Mount, action pb.FileActionRm) error {
+func (fb *Backend) Symlink(ctx context.Context, m, user, group fileoptypes.Mount, action *pb.FileActionSymlink) error {
+	mnt, ok := m.(*Mount)
+	if !ok {
+		return errors.Errorf("invalid mount type %T", m)
+	}
+
+	lm := snapshot.LocalMounter(mnt.m)
+	dir, err := lm.Mount()
+	if err != nil {
+		return err
+	}
+	defer lm.Unmount()
+
+	u, err := fb.readUserWrapper(action.Owner, user, group)
+	if err != nil {
+		return err
+	}
+
+	return symlink(dir, action, u, mnt.m.IdentityMapping())
+}
+
+func (fb *Backend) Rm(ctx context.Context, m fileoptypes.Mount, action *pb.FileActionRm) error {
 	mnt, ok := m.(*Mount)
 	if !ok {
 		return errors.Errorf("invalid mount type %T", m)
@@ -286,7 +365,7 @@ func (fb *Backend) Rm(ctx context.Context, m fileoptypes.Mount, action pb.FileAc
 	return rm(dir, action)
 }
 
-func (fb *Backend) Copy(ctx context.Context, m1, m2, user, group fileoptypes.Mount, action pb.FileActionCopy) error {
+func (fb *Backend) Copy(ctx context.Context, m1, m2, user, group fileoptypes.Mount, action *pb.FileActionCopy) error {
 	mnt1, ok := m1.(*Mount)
 	if !ok {
 		return errors.Errorf("invalid mount type %T", m1)
@@ -345,11 +424,7 @@ func (fb *Backend) readUserWrapper(owner *pb.ChownOpt, user, group fileoptypes.M
 	return u, nil
 }
 
-func cleanPath(s string) (string, error) {
-	s, err := system.CheckSystemDriveAndRemoveDriveLetter(s, runtime.GOOS)
-	if err != nil {
-		return "", errors.Wrap(err, "removing drive letter")
-	}
+func cleanPath(s string) string {
 	s = filepath.FromSlash(s)
 	s2 := filepath.Join("/", s)
 	if strings.HasSuffix(s, string(filepath.Separator)+".") {
@@ -360,5 +435,5 @@ func cleanPath(s string) (string, error) {
 	} else if strings.HasSuffix(s, string(filepath.Separator)) && s2 != string(filepath.Separator) {
 		s2 += string(filepath.Separator)
 	}
-	return s2, nil
+	return s2
 }

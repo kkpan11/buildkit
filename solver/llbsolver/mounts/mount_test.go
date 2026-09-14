@@ -8,15 +8,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/diff/apply"
-	"github.com/containerd/containerd/diff/walking"
-	"github.com/containerd/containerd/leases"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/native"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff/apply"
+	"github.com/containerd/containerd/v2/core/leases"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/containerd/v2/plugins/diff/walking"
+	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/snapshot"
@@ -46,7 +46,7 @@ type cmOut struct {
 func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
-		return nil, errors.Errorf("namespace required for test")
+		return nil, errors.New("namespace required for test")
 	}
 
 	if opt.snapshotterName == "" {
@@ -84,7 +84,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, e
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		opt.snapshotterName: opt.snapshotter,
 	})
-	if err := mdb.Init(context.TODO()); err != nil {
+	if err := mdb.Init(t.Context()); err != nil {
 		return nil, err
 	}
 
@@ -109,6 +109,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, e
 		Differ:         differ,
 		LeaseManager:   lm,
 		GarbageCollect: mdb.GarbageCollect,
+		Root:           tmpdir,
 		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
 	})
 	if err != nil {
@@ -136,7 +137,7 @@ func newRefGetter(m cache.Manager, shared *cacheRefs) *cacheRefGetter {
 
 func TestCacheMountPrivateRefs(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -179,7 +180,7 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 	require.NotEqual(t, ref.ID(), ref4.ID())
 
 	// releasing one of two refs still keeps first ID private
-	ref.Release(context.TODO())
+	ref.Release(t.Context())
 
 	ref5, err := g3.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_PRIVATE)
 	require.NoError(t, err)
@@ -187,7 +188,7 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 	require.NotEqual(t, ref4.ID(), ref5.ID())
 
 	// releasing all refs releases ID to be reused
-	ref3.Release(context.TODO())
+	ref3.Release(t.Context())
 
 	ref5, err = g4.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_PRIVATE)
 	require.NoError(t, err)
@@ -202,7 +203,7 @@ func TestCacheMountPrivateRefs(t *testing.T) {
 
 func TestCacheMountSharedRefs(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -251,7 +252,7 @@ func TestCacheMountSharedRefs(t *testing.T) {
 
 func TestCacheMountLockedRefs(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -313,7 +314,7 @@ func TestCacheMountLockedRefs(t *testing.T) {
 // moby/buildkit#1322
 func TestCacheMountSharedRefsDeadlock(t *testing.T) {
 	// not parallel
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -347,10 +348,10 @@ func TestCacheMountSharedRefsDeadlock(t *testing.T) {
 		cacheRefReleaseHijack = nil
 		cacheRefCloneHijack = nil
 	}()
-	eg, _ := errgroup.WithContext(context.TODO())
+	eg, _ := errgroup.WithContext(t.Context())
 
 	eg.Go(func() error {
-		return ref.Release(context.TODO())
+		return ref.Release(t.Context())
 	})
 	eg.Go(func() error {
 		_, err := g2.getRefCacheDir(ctx, nil, "foo", pb.CacheSharingOpt_SHARED)

@@ -1,5 +1,4 @@
 //go:build nydus
-// +build nydus
 
 package client
 
@@ -7,8 +6,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/nydus-snapshotter/pkg/converter"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/identity"
@@ -98,7 +97,7 @@ func testBuildExportNydusWithHybrid(t *testing.T, sb integration.Sandbox) {
 
 		mediaTypes := map[compression.Type]string{
 			compression.Gzip: ocispecs.MediaTypeImageLayerGzip,
-			compression.Zstd: ocispecs.MediaTypeImageLayer + "+zstd",
+			compression.Zstd: ocispecs.MediaTypeImageLayerZstd,
 		}
 		target := fmt.Sprintf("%s/%s/alpine:%s", registry, compType, identity.NewID())
 		_, err = c.Solve(sb.Context(), def, SolveOpt{

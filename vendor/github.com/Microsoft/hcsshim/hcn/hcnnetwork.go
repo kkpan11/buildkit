@@ -11,6 +11,15 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// SubnetFlags represents the flags that can be set on a subnet
+type SubnetFlags uint32
+
+// SubnetFlags constants (based on HNS API documentation)
+const (
+	SubnetFlagsNone                       SubnetFlags = 0
+	SubnetFlagsDoNotReserveGatewayAddress SubnetFlags = 1 // This flag is needed to support scenario  GatewayAddress == ManagementIP
+)
+
 // Route is associated with a subnet.
 type Route struct {
 	NextHop           string `json:",omitempty"`
@@ -23,6 +32,7 @@ type Subnet struct {
 	IpAddressPrefix string            `json:",omitempty"`
 	Policies        []json.RawMessage `json:",omitempty"`
 	Routes          []Route           `json:",omitempty"`
+	Flags           SubnetFlags       `json:",omitempty"`
 }
 
 // Ipam (Internet Protocol Address Management) is associated with a network
@@ -72,6 +82,8 @@ type NetworkFlags uint32
 const (
 	None                NetworkFlags = 0
 	EnableNonPersistent NetworkFlags = 8
+	DisableHostPort     NetworkFlags = 1024
+	EnableIov           NetworkFlags = 8192
 )
 
 // HostComputeNetwork represents a network

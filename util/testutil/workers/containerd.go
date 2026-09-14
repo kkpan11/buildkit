@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,8 +26,8 @@ func InitContainerdWorker() {
 	// defined in Dockerfile
 	// e.g. `containerd-1.1=/opt/containerd-1.1/bin,containerd-42.0=/opt/containerd-42.0/bin`
 	if s := os.Getenv("BUILDKIT_INTEGRATION_CONTAINERD_EXTRA"); s != "" {
-		entries := strings.Split(s, ",")
-		for _, entry := range entries {
+		entries := strings.SplitSeq(s, ",")
+		for entry := range entries {
 			pair := strings.Split(strings.TrimSpace(entry), "=")
 			if len(pair) != 2 {
 				panic(errors.Errorf("unexpected BUILDKIT_INTEGRATION_CONTAINERD_EXTRA: %q", s))
@@ -102,6 +103,7 @@ func (c *Containerd) New(ctx context.Context, cfg *integration.BackendConfig) (b
 	if err := requireRoot(); err != nil {
 		return nil, nil, err
 	}
+	extraEnv := slices.Clone(c.ExtraEnv)
 
 	deferF := &integration.MultiCloser{}
 	cl = deferF.F()
@@ -135,11 +137,12 @@ func (c *Containerd) New(ctx context.Context, cfg *integration.BackendConfig) (b
 	deferF.Append(func() error { return os.RemoveAll(tmpdir) })
 
 	address := getContainerdSock(tmpdir)
-	config := fmt.Sprintf(`root = %q
+	config := fmt.Sprintf(`version = 2
+root = %q
 state = %q
 # CRI plugins listens on 10010/tcp for stream server.
 # We disable CRI plugin so that multiple instance can run simultaneously.
-disabled_plugins = ["cri"]
+disabled_plugins = ["io.containerd.grpc.v1.cri"]
 
 [grpc]
   address = %q
@@ -187,11 +190,11 @@ disabled_plugins = ["cri"]
 			"CONTAINERD_ROOTLESS_ROOTLESSKIT_NET=host",
 			"CONTAINERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=none",
 			"CONTAINERD_ROOTLESS_ROOTLESSKIT_FLAGS=--mtu=0",
-		}, c.ExtraEnv...), "containerd-rootless.sh", "-c", configFile)
+		}, extraEnv...), "containerd-rootless.sh", "-c", configFile)
 	}
 
-	cmd := exec.Command(containerdArgs[0], containerdArgs[1:]...) //nolint:gosec // test utility
-	cmd.Env = append(os.Environ(), c.ExtraEnv...)
+	cmd := exec.CommandContext(context.TODO(), containerdArgs[0], containerdArgs[1:]...) //nolint:gosec // test utility
+	cmd.Env = append(os.Environ(), extraEnv...)
 
 	ctdStop, err := integration.StartCmd(cmd, cfg.Logs)
 	if err != nil {
@@ -216,7 +219,7 @@ disabled_plugins = ["cri"]
 	buildkitdArgs = append(buildkitdArgs, snBuildkitdArgs...)
 
 	if runtime.GOOS != "windows" && c.Snapshotter != "native" {
-		c.ExtraEnv = append(c.ExtraEnv, "BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF=true")
+		extraEnv = append(extraEnv, "BUILDKIT_DEBUG_FORCE_OVERLAY_DIFF=true")
 	}
 	if rootless {
 		pidStr, err := os.ReadFile(filepath.Join(rootlessKitState, "child_pid"))
@@ -231,7 +234,7 @@ disabled_plugins = ["cri"]
 			"nsenter", "-U", "--preserve-credentials", "-m", "-t", fmt.Sprintf("%d", pid)},
 			append(buildkitdArgs, "--containerd-worker-snapshotter=native")...)
 	}
-	buildkitdSock, stop, err := runBuildkitd(cfg, buildkitdArgs, cfg.Logs, c.UID, c.GID, c.ExtraEnv)
+	buildkitdSock, debugSock, stop, err := runBuildkitd(cfg, buildkitdArgs, cfg.Logs, c.UID, c.GID, extraEnv)
 	if err != nil {
 		integration.PrintLogs(cfg.Logs, log.Println)
 		return nil, nil, err
@@ -241,10 +244,11 @@ disabled_plugins = ["cri"]
 	return backend{
 		address:           buildkitdSock,
 		containerdAddress: address,
+		debugAddress:      debugSock,
 		rootless:          rootless,
 		netnsDetached:     false,
 		snapshotter:       c.Snapshotter,
-		extraEnv:          c.ExtraEnv,
+		extraEnv:          extraEnv,
 	}, cl, nil
 }
 
@@ -276,7 +280,7 @@ func runStargzSnapshotter(cfg *integration.BackendConfig) (address string, cl fu
 
 	address = filepath.Join(tmpStargzDir, "containerd-stargz-grpc.sock")
 	stargzRootDir := filepath.Join(tmpStargzDir, "root")
-	cmd := exec.Command(binary,
+	cmd := exec.CommandContext(context.TODO(), binary,
 		"--log-level", "debug",
 		"--address", address,
 		"--root", stargzRootDir)

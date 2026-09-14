@@ -3,14 +3,18 @@ area/project:
   - all:
       - changed-files:
           - any-glob-to-any-file:
-              - .github/**
-              - LICENSE
-              - AUTHORS
-              - MAINTAINERS
-              - PROJECT.md
-              - README.md
-              - .gitignore
-              - codecov.yml
+              - ".github/**"
+              - "LICENSE"
+              - "AUTHORS"
+              - "MAINTAINERS"
+              - "PROJECT.md"
+              - "README.md"
+              - ".gitignore"
+              - "codecov.yml"
+              - ".dockerignore"
+              - "docker-bake.hcl"
+              - "Dockerfile"
+              - "Makefile"
           - all-globs-to-all-files: "!.github/workflows/*"
 
 # Add 'ci' label to changes in the .github/workflows folder
@@ -22,7 +26,7 @@ area/ci:
 area/testing:
   - changed-files:
       - any-glob-to-any-file:
-          - tests/**
+          - "tests/**"
           - "**/*_test.go"
 
 # area:api
@@ -32,11 +36,12 @@ area/api:
 
 # area:storage
 area/storage:
-  - changed-files:
-      - any-glob-to-any-file:
-          - "cache/**"
-          - "snapshot/**"
-      - all-globs-to-all-files: "!cache/remotecache/**"
+  - all:
+      - changed-files:
+          - any-glob-to-any-file:
+              - "cache/**"
+              - "snapshot/**"
+          - all-globs-to-all-files: "!cache/remotecache/**"
 
 # area:remotecache
 area/remotecache:
@@ -63,14 +68,22 @@ area/buildkitd:
   - changed-files:
       - any-glob-to-any-file: "cmd/buildkitd/**"
 
+# area:cdi
+area/cdi:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "contrib/cdisetup/**"
+          - "docs/cdi.md"
+          - "solver/llbsolver/cdidevices/**"
+
 # area:dependencies
 area/dependencies:
   - changed-files:
       - any-glob-to-any-file:
-          - go.mod
-          - go.sum
-          - vendor/**
-          - tools/**
+          - "go.mod"
+          - "go.sum"
+          - "vendor/**"
+          - "tools/**"
 
 # area:docs
 area/docs:
@@ -114,7 +127,9 @@ area/frontend:
 # area:hack
 area/hack:
   - changed-files:
-      - any-glob-to-any-file: "hack/**"
+      - any-glob-to-any-file:
+          - "hack/**"
+          - "frontend/dockerfile/cmd/dockerfile-frontend/hack/**"
 
 # area:session
 area/session:
@@ -150,6 +165,7 @@ area/worker:
 
 # area:windows
 area/windows:
-  - changed-files:
-      - any-glob-to-any-file:
-          - "**/*_windows.go"
+  - all:
+      - changed-files:
+          - any-glob-to-any-file: "**/*_windows.go"
+          - all-globs-to-all-files: "!vendor/**/*_windows.go"

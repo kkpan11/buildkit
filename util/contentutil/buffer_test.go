@@ -2,12 +2,11 @@ package contentutil
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"testing"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	cerrdefs "github.com/containerd/errdefs"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -17,7 +16,7 @@ import (
 
 func TestReadWrite(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b := NewBuffer()
 
@@ -47,7 +46,7 @@ func TestReadWrite(t *testing.T) {
 
 func TestReaderAt(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b := NewBuffer()
 
@@ -75,7 +74,7 @@ func TestReaderAt(t *testing.T) {
 
 func TestLabels(t *testing.T) {
 	t.Parallel()
-	ctx := context.TODO()
+	ctx := t.Context()
 
 	b := NewBuffer()
 

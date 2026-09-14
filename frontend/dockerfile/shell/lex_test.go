@@ -498,6 +498,26 @@ func TestProcessWithMatches(t *testing.T) {
 			matches:  map[string]struct{}{"FOO": {}, "BAR": {}},
 		},
 		{
+			input:       "${FOO:#}",
+			envs:        map[string]string{},
+			expectedErr: true,
+		},
+		{
+			input:       "${FOO:##}",
+			envs:        map[string]string{},
+			expectedErr: true,
+		},
+		{
+			input:       "${FOO:%}",
+			envs:        map[string]string{},
+			expectedErr: true,
+		},
+		{
+			input:       "${FOO:%%}",
+			envs:        map[string]string{},
+			expectedErr: true,
+		},
+		{
 			// test: wildcards
 			input:    "${FOO/$NEEDLE/.} - ${FOO//$NEEDLE/.}",
 			envs:     map[string]string{"FOO": "/foo*/*/*.txt", "NEEDLE": "\\*/"},
@@ -565,7 +585,6 @@ func TestProcessWithMatches(t *testing.T) {
 	}
 
 	for _, c := range tc {
-		c := c
 		t.Run(c.input, func(t *testing.T) {
 			result, err := shlex.ProcessWordWithMatches(c.input, envsFromMap(c.envs))
 			w := result.Result

@@ -1,7 +1,6 @@
 package sourcepolicy
 
 import (
-	"context"
 	"testing"
 
 	"github.com/moby/buildkit/solver/pb"
@@ -15,6 +14,7 @@ func TestEngineEvaluate(t *testing.T) {
 	t.Run("Deny All", testDenyAll)
 	t.Run("Allow Deny", testAllowDeny)
 	t.Run("Convert", testConvert)
+	t.Run("Convert exact", testConvertExact)
 	t.Run("Convert Deny", testConvertDeny)
 	t.Run("Allow Convert Deny", testAllowConvertDeny)
 	t.Run("Test convert loop", testConvertLoop)
@@ -53,7 +53,7 @@ func testLastRuleWins(t *testing.T) {
 	}
 
 	e := NewEngine(pol)
-	mut, err := e.Evaluate(context.Background(), &pb.SourceOp{
+	mut, err := e.Evaluate(t.Context(), &pb.SourceOp{
 		Identifier: "docker-image://docker.io/library/busybox:latest",
 	})
 	require.NoError(t, err)
@@ -85,7 +85,7 @@ func testMultiplePolicies(t *testing.T) {
 	}
 
 	e := NewEngine(pol)
-	mut, err := e.Evaluate(context.Background(), &pb.SourceOp{
+	mut, err := e.Evaluate(t.Context(), &pb.SourceOp{
 		Identifier: "docker-image://docker.io/library/busybox:latest",
 	})
 	require.ErrorIs(t, err, ErrSourceDenied)
@@ -131,7 +131,7 @@ func testConvertMultiple(t *testing.T) {
 		Identifier: "docker-image://docker.io/library/busybox:latest",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine(pol)
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -161,7 +161,7 @@ func testConvertWildcard(t *testing.T) {
 		Identifier: "docker-image://docker.io/library/golang:1.19",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine(pol)
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -190,7 +190,7 @@ func testConvertRegex(t *testing.T) {
 		Identifier: "docker-image://docker.io/library/golang:1.19",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine([]*spb.Policy{pol})
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -218,7 +218,7 @@ func testConvertHTTP(t *testing.T) {
 		Identifier: "https://example.com/foo",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine([]*spb.Policy{pol})
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -255,7 +255,7 @@ func testConvertLoop(t *testing.T) {
 		Identifier: "docker-image://docker.io/library/busybox:latest",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine([]*spb.Policy{pol})
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -300,7 +300,7 @@ func testAllowConvertDeny(t *testing.T) {
 		Identifier: "docker-image://docker.io/library/busybox:latest",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine([]*spb.Policy{pol})
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -334,7 +334,7 @@ func testConvertDeny(t *testing.T) {
 		Identifier: "docker-image://docker.io/library/busybox:latest",
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine([]*spb.Policy{pol})
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -370,7 +370,7 @@ func testConvert(t *testing.T) {
 				},
 			}
 
-			ctx := context.Background()
+			ctx := t.Context()
 			e := NewEngine([]*spb.Policy{pol})
 
 			mutated, err := e.Evaluate(ctx, op)
@@ -379,6 +379,34 @@ func testConvert(t *testing.T) {
 			require.Equal(t, dst, op.Identifier)
 		})
 	}
+}
+
+func testConvertExact(t *testing.T) {
+	src := "docker-image://docker.io/library/busybox:latest"
+	dst := "docker-image://docker.io/library/busybox@sha256:c0d488a800e4127c334ad20d61d7bc21b4097540327217dfab52262adc02380c"
+	op := &pb.SourceOp{
+		Identifier: src,
+	}
+
+	pol := &spb.Policy{
+		Rules: []*spb.Rule{
+			{
+				Action: spb.PolicyAction_CONVERT,
+				Selector: &spb.Selector{
+					Identifier: src,
+					MatchType:  spb.MatchType_EXACT,
+				},
+				Updates: &spb.Update{
+					Identifier: dst,
+				},
+			},
+		},
+	}
+
+	mutated, err := NewEngine([]*spb.Policy{pol}).Evaluate(t.Context(), op)
+	require.True(t, mutated)
+	require.NoError(t, err)
+	require.Equal(t, dst, op.Identifier)
 }
 
 func testAllowDeny(t *testing.T) {
@@ -402,7 +430,7 @@ func testAllowDeny(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	e := NewEngine([]*spb.Policy{pol})
 
 	mutated, err := e.Evaluate(ctx, op)
@@ -439,7 +467,7 @@ func testDenyAll(t *testing.T) {
 			}
 
 			e := NewEngine([]*spb.Policy{pol})
-			ctx := context.Background()
+			ctx := t.Context()
 
 			op := &pb.SourceOp{
 				Identifier: ref,

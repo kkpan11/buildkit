@@ -10,7 +10,7 @@ import (
 	"github.com/Microsoft/go-winio/pkg/guid"
 )
 
-//go:generate go run github.com/Microsoft/go-winio/tools/mkwinsyscall -output zsyscall_windows.go hcn.go
+//go:generate go tool github.com/Microsoft/go-winio/tools/mkwinsyscall -output zsyscall_windows.go hcn.go
 
 /// HNS V1 API
 
@@ -322,6 +322,30 @@ func NestedIpSetSupported() error {
 		return nil
 	}
 	return platformDoesNotSupportError("NestedIpSet")
+}
+
+// DisableHostPortSupported returns an error if the HCN version does not support DisableHostPort flag
+func DisableHostPortSupported() error {
+	supported, err := GetCachedSupportedFeatures()
+	if err != nil {
+		return err
+	}
+	if supported.DisableHostPort {
+		return nil
+	}
+	return platformDoesNotSupportError("DisableHostPort")
+}
+
+// AccelnetSupported returns an error if the HCN version does not support Accelnet Feature.
+func AccelnetSupported() error {
+	supported, err := GetCachedSupportedFeatures()
+	if err != nil {
+		return err
+	}
+	if supported.Accelnet {
+		return nil
+	}
+	return platformDoesNotSupportError("Accelnet")
 }
 
 // RequestType are the different operations performed to settings.

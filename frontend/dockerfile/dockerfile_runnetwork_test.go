@@ -17,16 +17,13 @@ import (
 	"github.com/tonistiigi/fsutil"
 )
 
-var runNetworkTests = integration.TestFuncs(
+// Tests that depend on the `network.*` entitlements
+var networkTests = integration.TestFuncs(
 	testRunDefaultNetwork,
 	testRunNoNetwork,
 	testRunHostNetwork,
 	testRunGlobalNetwork,
 )
-
-func init() {
-	networkTests = append(networkTests, runNetworkTests...)
-}
 
 func testRunDefaultNetwork(t *testing.T, sb integration.Sandbox) {
 	if os.Getenv("BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS") == "" {
@@ -132,7 +129,7 @@ RUN --network=host nc 127.0.0.1 %s | grep foo
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementNetworkHost},
+		AllowedEntitlements: []string{entitlements.EntitlementNetworkHost.String()},
 	}, nil)
 
 	hostAllowed := sb.Value("network.host")
@@ -147,7 +144,7 @@ RUN --network=host nc 127.0.0.1 %s | grep foo
 			require.NoError(t, err)
 		}
 	default:
-		require.Fail(t, "unexpected network.host mode %q", hostAllowed)
+		require.Fail(t, fmt.Sprintf("unexpected network.host mode %q", hostAllowed))
 	}
 }
 
@@ -180,7 +177,7 @@ RUN --network=none ! nc -z 127.0.0.1 %s
 			dockerui.DefaultLocalNameDockerfile: dir,
 			dockerui.DefaultLocalNameContext:    dir,
 		},
-		AllowedEntitlements: []entitlements.Entitlement{entitlements.EntitlementNetworkHost},
+		AllowedEntitlements: []string{entitlements.EntitlementNetworkHost.String()},
 		FrontendAttrs: map[string]string{
 			"force-network-mode": "host",
 		},
@@ -198,6 +195,6 @@ RUN --network=none ! nc -z 127.0.0.1 %s
 			require.NoError(t, err)
 		}
 	default:
-		require.Fail(t, "unexpected network.host mode %q", hostAllowed)
+		require.Fail(t, fmt.Sprintf("unexpected network.host mode %q", hostAllowed))
 	}
 }

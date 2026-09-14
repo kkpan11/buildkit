@@ -20,6 +20,9 @@ the rules. To run a check, use the `--check` flag:
 $ docker build --check .
 ```
 
+To learn more about how to use build checks, see
+[Checking your build configuration](https://docs.docker.com/build/checks/).
+
 <table>
   <thead>
     <tr>
@@ -99,6 +102,18 @@ $ docker build --check .
     <tr>
       <td><a href="./copy-ignored-file/">CopyIgnoredFile</a></td>
       <td>Attempting to Copy file that is excluded by .dockerignore</td>
+    </tr>
+    <tr>
+      <td><a href="./invalid-definition-description/">InvalidDefinitionDescription (experimental)</a></td>
+      <td>Comment for build stage or argument should follow the format: `# <arg/stage name> <description>`. If this is not intended to be a description comment, add an empty line or comment between the instruction and the comment.</td>
+    </tr>
+    <tr>
+      <td><a href="./expose-proto-casing/">ExposeProtoCasing</a></td>
+      <td>Protocol in EXPOSE instruction should be lowercase</td>
+    </tr>
+    <tr>
+      <td><a href="./expose-invalid-format/">ExposeInvalidFormat</a></td>
+      <td>IP address and host-port mapping should not be used in EXPOSE instruction. This will become an error in a future release</td>
     </tr>
   </tbody>
 </table>

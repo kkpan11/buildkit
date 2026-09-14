@@ -6,7 +6,6 @@
 [![PkgGoDev](https://img.shields.io/badge/go.dev-docs-007d9c?style=flat-square&logo=go&logoColor=white)](https://pkg.go.dev/github.com/moby/buildkit/client/llb)
 [![CI BuildKit Status](https://img.shields.io/github/actions/workflow/status/moby/buildkit/buildkit.yml?label=buildkit&logo=github&style=flat-square)](https://github.com/moby/buildkit/actions?query=workflow%3Abuildkit)
 [![CI Frontend Status](https://img.shields.io/github/actions/workflow/status/moby/buildkit/frontend.yml?label=frontend&logo=github&style=flat-square)](https://github.com/moby/buildkit/actions?query=workflow%3Afrontend)
-[![Go Report Card](https://goreportcard.com/badge/github.com/moby/buildkit?style=flat-square)](https://goreportcard.com/report/github.com/moby/buildkit)
 [![Codecov](https://img.shields.io/codecov/c/github/moby/buildkit?logo=codecov&style=flat-square)](https://codecov.io/gh/moby/buildkit)
 
 BuildKit is a toolkit for converting source code to build artifacts in an efficient, expressive and repeatable manner.
@@ -30,14 +29,12 @@ Introductory blog post https://blog.mobyproject.org/introducing-buildkit-17e056c
 
 Join `#buildkit` channel on [Docker Community Slack](https://dockr.ly/comm-slack)
 
-> **Note**
->
+> [!NOTE]
 > If you are visiting this repo for the usage of BuildKit-only Dockerfile features
 > like `RUN --mount=type=(bind|cache|tmpfs|secret|ssh)`, please refer to the
 > [Dockerfile reference](https://docs.docker.com/engine/reference/builder/).
 
-> **Note**
->
+> [!NOTE]
 > `docker build` [uses Buildx and BuildKit by default](https://docs.docker.com/build/architecture/) since Docker Engine 23.0.
 > You don't need to read this document unless you want to use the full-featured
 > standalone version of BuildKit.
@@ -113,6 +110,8 @@ BuildKit is used by the following projects:
 -   [Depot](https://depot.dev)
 -   [Namespace](https://namespace.so)
 -   [Unikraft](https://unikraft.org)
+-   [DevZero](https://devzero.io)
+-   [dacc](https://github.com/r2d4/dacc)
 
 ## Quick start
 
@@ -204,6 +203,10 @@ Currently, the following high-level languages have been implemented for LLB:
 -   [Blubber](https://gitlab.wikimedia.org/repos/releng/blubber)
 -   [Bass](https://github.com/vito/bass)
 -   [kraft.yaml (Unikraft)](https://github.com/unikraft/kraftkit/tree/staging/tools/dockerfile-llb-frontend)
+-   [r2d4/llb (JSON Gateway)](https://github.com/r2d4/llb)
+-   [Massé](https://github.com/marxarelli/masse)
+-   [DALEC](https://github.com/project-dalec/dalec)
+-   [Dexfile](https://github.com/dexnore/dexfile)
 -   (open a PR to add your own language)
 
 ### Exploring Dockerfiles
@@ -281,6 +284,7 @@ Keys supported by image output:
 * `push-by-digest=true`: push unnamed image
 * `registry.insecure=true`: push to insecure HTTP registry
 * `oci-mediatypes=true`: use OCI mediatypes in configuration JSON instead of Docker's
+* `oci-artifact=true`: use OCI artifact format for attestations when OCI media types are enabled. Set to `false` to use the legacy attestation image manifest format.
 * `unpack=true`: unpack image after creation (for use with containerd)
 * `dangling-name-prefix=<value>`: name image with `prefix@<digest>`, used for anonymous images
 * `name-canonical=true`: add additional canonical name `name@<digest>`
@@ -365,6 +369,15 @@ $ tree ./bin
     └── hello-linux-arm64
 ```
 
+Local output also supports `mode=<copy|delete>`:
+
+- `copy` (default) preserves existing files in destination that are not present in build result.
+- `delete` removes destination files and directories that are not present in build result.
+
+```bash
+buildctl build ... --output type=local,dest=./bin/release,mode=delete
+```
+
 Tar exporter is similar to local exporter but transfers the files through a tarball.
 
 ```bash
@@ -423,7 +436,7 @@ BuildKit supports the following cache exporters:
 * `gha`: export to GitHub Actions cache
 
 In most case you want to use the `inline` cache exporter.
-However, note that the `inline` cache exporter only supports `min` cache mode. 
+However, note that the `inline` cache exporter only supports `min` cache mode.
 To enable `max` cache mode, push the image and the cache separately by using `registry` cache exporter.
 
 `inline` and `registry` exporters both store the cache in the registry. For importing the cache, `type=registry` is sufficient for both, as specifying the cache format is not necessary.
@@ -441,7 +454,7 @@ Note that the inline cache is not imported unless [`--import-cache type=registry
 
 Inline cache embeds cache metadata into the image config. The layers in the image will be left untouched compared to the image with no cache information.
 
-:information_source: Docker-integrated BuildKit (`DOCKER_BUILDKIT=1 docker build`) and `docker buildx`requires 
+:information_source: Docker-integrated BuildKit (`DOCKER_BUILDKIT=1 docker build`) and `docker buildx` requires
 `--build-arg BUILDKIT_INLINE_CACHE=1` to be specified to enable the `inline` cache exporter.
 However, the standalone `buildctl` does NOT require `--opt build-arg:BUILDKIT_INLINE_CACHE=1` and the build-arg is simply ignored.
 
@@ -460,7 +473,7 @@ buildctl build ... \
   * `min`: only export layers for the resulting image
   * `max`: export all the layers of all intermediate steps
 * `ref=<ref>`: specify repository reference to store cache, e.g. `docker.io/user/image:tag`
-* `image-manifest=<true|false>`: whether to export cache manifest as an OCI-compatible image manifest rather than a manifest list/index (default: `false`, must be used with `oci-mediatypes=true`)
+* `image-manifest=<true|false>`: whether to export cache manifest as an OCI-compatible image manifest rather than a manifest list/index (default: `true` since BuildKit `v0.21`, must be used with `oci-mediatypes=true`)
 * `oci-mediatypes=<true|false>`: whether to use OCI mediatypes in exported manifests (default: `true`, since BuildKit `v0.8`)
 * `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. estargz and zstd should be used with `oci-mediatypes=true`
 * `compression-level=<value>`: choose compression level for gzip, estargz (0-9) and zstd (0-22)
@@ -487,12 +500,13 @@ The directory layout conforms to OCI Image Spec v1.0.
   * `max`: export all the layers of all intermediate steps
 * `dest=<path>`: destination directory for cache exporter
 * `tag=<tag>`: specify custom tag of image to write to local index (default: `latest`)
-* `image-manifest=<true|false>`: whether to export cache manifest as an OCI-compatible image manifest rather than a manifest list/index (default: `false`, must be used with `oci-mediatypes=true`)
+* `image-manifest=<true|false>`: whether to export cache manifest as an OCI-compatible image manifest rather than a manifest list/index (default: `true` since BuildKit `v0.21`, must be used with `oci-mediatypes=true`)
 * `oci-mediatypes=<true|false>`: whether to use OCI mediatypes in exported manifests (default `true`, since BuildKit `v0.8`)
 * `compression=<uncompressed|gzip|estargz|zstd>`: choose compression type for layers newly created and cached, gzip is default value. estargz and zstd should be used with `oci-mediatypes=true`.
 * `compression-level=<value>`: compression level for gzip, estargz (0-9) and zstd (0-22)
 * `force-compression=true`: forcibly apply `compression` option to all layers
 * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
+* `reset=<true|false>`: remove any blobs in the cache directory that are not referenced by the current manifests in `index.json` (default: `false`). This is useful for keeping the local cache directory from growing indefinitely.
 
 `--import-cache` options:
 * `type=local`
@@ -514,7 +528,8 @@ GitHub Actions cache saves both cache metadata and layers to GitHub's Cache serv
 Similarly to using [actions/cache](https://github.com/actions/cache), caches are [scoped by branch](https://docs.github.com/en/actions/advanced-guides/caching-dependencies-to-speed-up-workflows#restrictions-for-accessing-a-cache), with the default and target branches being available to every branch.
 
 Following attributes are required to authenticate against the [GitHub Actions Cache service API](https://github.com/tonistiigi/go-actions-cache/blob/master/api.md#authentication):
-* `url`: Cache server URL (default `$ACTIONS_CACHE_URL`)
+* `url`: Cache server URL (default `$ACTIONS_CACHE_URL` or fallback to `$ACTIONS_RESULTS_URL`)
+* `url_v2`: Cache v2 server URL if `$ACTIONS_CACHE_SERVICE_V2` set on the runner (default `$ACTIONS_RESULTS_URL`)
 * `token`: Access token (default `$ACTIONS_RUNTIME_TOKEN`)
 
 :information_source: This type of cache can be used with [Docker Build Push Action](https://github.com/docker/build-push-action)
@@ -557,14 +572,15 @@ S3 configuration:
 * `manifests_prefix`: global prefix to store / read manifests on s3 (default: `manifests/`)
 * `endpoint_url`: specify a specific S3 endpoint (default: empty)
 * `use_path_style`: if set to `true`, put the bucket name in the URL instead of in the hostname (default: `false`)
+* `disable_accept_encoding`: if set to `true`, removes the `DisableAcceptEncodingGzip` middleware from the AWS SDK request pipeline (default: `false`). Useful with S3-compatible backends like GCS, where the proxy can mutate the `Accept-Encoding` header after request signing, causing `SignatureDoesNotMatch` (403) errors. See [#3749](https://github.com/moby/buildkit/issues/3749).
 
 AWS Authentication:
 
-The simplest way is to use an IAM Instance profile.
-Other options are:
+BuildKit relies on the [AWS Go SDK](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-gosdk.html). This means that all standard authentication methods through [environment variables](https://pkg.go.dev/github.com/aws/aws-sdk-go-v2/config#EnvConfig) or config files are supported. This is especially true for AWS EC2 IAM Profile and AWS Web Identity Token (IAM roles in Kubernetes).
 
-* Any system using environment variables / config files supported by the [AWS Go SDK](https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html). The configuration must be available for the buildkit daemon, not for the client.
-* Using the following attributes:
+Beware, these configurations must be available at buildkit daemon level, not at client level.
+
+* The following attributes can be used to forward static credentials from a buildkit client to the daemon (buildx for example).
   * `access_key_id`: Access Key ID
   * `secret_access_key`: Secret Access Key
   * `session_token`: Session Token
@@ -578,6 +594,10 @@ Other options are:
 * `name=<manifest>`: specify name of the manifest to use (default `buildkit`)
   * Multiple manifest names can be specified at the same time, separated by `;`. The standard use case is to use the git sha1 as name, and the branch name as duplicate, and load both with 2 `import-cache` commands.
 * `ignore-error=<false|true>`: specify if error is ignored in case cache export fails (default: `false`)
+* `touch_refresh=24h`: Instead of being uploaded again when not changed, blobs files will be "touched" on s3 every `touch_refresh`, default is 24h. Due to this, an expiration policy can be set on the S3 bucket to cleanup useless files automatically. Manifests files are systematically rewritten, there is no need to touch them.
+* `upload_parallelism=4`: This parameter changes the number of layers uploaded to s3 in parallel. Each individual layer is uploaded with 5 threads, using the Upload manager provided by the AWS SDK.
+* `retry_mode=<standard|adaptive>`: sets the AWS SDK retry mode (default: `standard`). `standard` uses exponential backoff, `adaptive` adds client-side rate limiting. See [AWS retry documentation](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html).
+* `retry_max_attempts=<int>`: sets the maximum number of attempts for each S3 request, including the initial request and all retries (default: 3). Must be a positive integer.
 
 `--import-cache` options:
 * `type=s3`
@@ -614,8 +634,7 @@ There are 2 options supported for Azure Blob Storage authentication:
 * Any system using environment variables supported by the [Azure SDK for Go](https://docs.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication). The configuration must be available for the buildkit daemon, not for the client.
 * Secret Access Key, using the `secret_access_key` attribute to specify the primary or secondary account key for your Azure Blob Storage account. [Azure Blob Storage account keys](https://docs.microsoft.com/en-us/azure/storage/common/storage-account-keys-manage)
 
-> **Note**
->
+> [!NOTE]
 > Account name can also be specified with `account_name` attribute (or `$BUILDKIT_AZURE_STORAGE_ACCOUNT_NAME`)
 > if it is not part of the account URL host.
 
@@ -775,7 +794,7 @@ docker run \
     --rm \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
-    -e BUILDKITD_FLAGS=--oci-worker-no-process-sandbox \
+    --security-opt systempaths=unconfined \
     -v /path/to/dir:/tmp/work \
     --entrypoint buildctl-daemonless.sh \
     moby/buildkit:master-rootless \
@@ -789,20 +808,37 @@ docker run \
 ## OpenTelemetry support
 
 BuildKit supports [OpenTelemetry](https://opentelemetry.io/) for buildkitd gRPC
-API and buildctl commands. To capture the trace to
-[Jaeger](https://github.com/jaegertracing/jaeger), set `JAEGER_TRACE`
-environment variable to the collection address.
+API and buildctl commands. BuildKit can export traces from `buildkitd` with the
+[OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/).
+`buildctl` forwards its spans to `buildkitd`, so the exporter only needs to be
+configured for the daemon.
+
+For example, start a Jaeger all-in-one collector with its OTLP gRPC endpoint and
+web interface exposed:
 
 ```bash
-docker run -d -p6831:6831/udp -p16686:16686 jaegertracing/all-in-one:latest
-export JAEGER_TRACE=0.0.0.0:6831
-# restart buildkitd and buildctl so they know JAEGER_TRACE
-# any buildctl command should be traced to http://127.0.0.1:16686/
+docker run -d -p4317:4317 -p16686:16686 jaegertracing/all-in-one:latest
 ```
 
-> On Windows, if you are running Jaeger outside of a container, [`jaeger-all-in-one.exe`](https://www.jaegertracing.io/docs/1.57/getting-started/#all-in-one),
-> set the environment variable `setx -m JAEGER_TRACE "0.0.0.0:6831"`,
-> restart `buildkitd` in a new terminal and the traces will be collected automatically.
+Configure the OTLP exporter in the environment used to start `buildkitd`:
+
+```bash
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4317
+# start or restart buildkitd from this environment
+```
+
+The endpoint is resolved from the network namespace where `buildkitd` runs. If
+the daemon runs in a container or on another host, replace `127.0.0.1` with an
+address that it can reach. After running a `buildctl` command, view its traces in
+the [Jaeger UI](http://127.0.0.1:16686/). Any OTLP-compatible collector or
+backend can be used instead of Jaeger.
+
+The example uses OTLP over gRPC, BuildKit's default OTLP transport. For endpoint,
+TLS, and authentication settings supported by the OTLP gRPC exporter, see the
+[OpenTelemetry Go exporter documentation](https://pkg.go.dev/go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc).
+BuildKit handles exporter selection separately and does not support every value
+defined by the general OpenTelemetry SDK environment-variable specification.
 
 ## Running BuildKit without root privileges
 

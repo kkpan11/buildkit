@@ -105,7 +105,7 @@ RUN --mount=type=ssh apk update \
 	defer c.Close()
 
 	// not using t.TempDir() here because the path ends up longer than the unix socket max length
-	tmpDir, err := os.MkdirTemp("", "buildkit-ssh-test-")
+	tmpDir, err := os.MkdirTemp("", "buildkit-ssh-test-") //nolint:usetesting // see comment above
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		os.RemoveAll(tmpDir)
@@ -117,7 +117,7 @@ RUN --mount=type=ssh apk update \
 	sshAgentCmd.Stderr = sshAgentOutputBuf
 	require.NoError(t, sshAgentCmd.Start())
 	var found bool
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		_, err := os.Stat(sockPath)
 		if err == nil {
 			found = true

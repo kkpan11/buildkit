@@ -1,6 +1,3 @@
-//go:build dfparents
-// +build dfparents
-
 package dockerfile
 
 import (
@@ -19,6 +16,7 @@ import (
 var parentsTests = integration.TestFuncs(
 	testCopyParents,
 	testCopyRelativeParents,
+	testCopyParentsMissingDirectory,
 )
 
 func init() {
@@ -80,7 +78,8 @@ COPY --parents foo1/foo2/ba* .
 func testCopyRelativeParents(t *testing.T, sb integration.Sandbox) {
 	f := getFrontend(t, sb)
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM alpine AS base
 WORKDIR /test
 RUN <<eot
@@ -156,7 +155,61 @@ RUN <<eot
 	[ -f /out/d/e2/baz ]
 	[ -f /out/c/d/e/bar ] # via b2
 eot
-`)
+`,
+		`
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS base
+WORKDIR /test
+RUN mkdir a && mkdir a\b && mkdir a\b\c && mkdir a\b\c\d && mkdir a\b\c\d\e
+RUN mkdir a\b2 && mkdir a\b2\c && mkdir a\b2\c\d && mkdir a\b2\c\d\e
+RUN mkdir a\b\c2 && mkdir a\b\c2\d && mkdir a\b\c2\d\e
+RUN mkdir a\b\c2\d\e2
+RUN cmd /C "echo. > a\b\c\d\foo"
+RUN cmd /C "echo. > a\b\c\d\e\bay"
+RUN cmd /C "echo. > a\b2\c\d\e\bar"
+RUN cmd /C "echo. > a\b\c2\d\e\baz"
+RUN cmd /C "echo. > a\b\c2\d\e2\baz"
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS middle
+COPY --from=base --parents /test/a/b/./c/d /out/
+RUN if not exist \out\c\d\e exit /b 1
+RUN if not exist \out\c\d\foo exit /b 1
+RUN if exist \out\a exit /b 1
+RUN if exist \out\e exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS end
+COPY --from=base --parents /test/a/b/c/d/. /out/
+RUN if not exist \out\test\a\b\c\d\e exit /b 1
+RUN if not exist \out\test\a\b\c\d\foo exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS start
+COPY --from=base --parents ./test/a/b/c/d /out/
+RUN if not exist \out\test\a\b\c\d\e exit /b 1
+RUN if not exist \out\test\a\b\c\d\foo exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS double
+COPY --from=base --parents /test/a/./b/./c /out/
+RUN if not exist \out\b\c\d\e exit /b 1
+RUN if not exist \out\b\c\d\foo exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS wildcard
+COPY --from=base --parents /test/a/./*/c /out/
+RUN if not exist \out\b\c\d\e exit /b 1
+RUN if not exist \out\b2\c\d\e\bar exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS doublewildcard
+COPY --from=base --parents /test/a/b*/./c/**/e /out/
+RUN if not exist \out\c\d\e exit /b 1
+RUN if not exist \out\c\d\e\bay exit /b 1
+RUN if not exist \out\c\d\e\bar exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS doubleinputs
+COPY --from=base --parents /test/a/b/c*/./d/**/baz /test/a/b*/./c/**/bar /out/
+RUN if not exist \out\d\e\baz exit /b 1
+RUN if exist \out\d\e\bay exit /b 1
+RUN if not exist \out\d\e2\baz exit /b 1
+RUN if not exist \out\c\d\e\bar exit /b 1
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -179,5 +232,139 @@ eot
 			},
 		}, nil)
 		require.NoError(t, err)
+	}
+}
+
+func testCopyParentsMissingDirectory(t *testing.T, sb integration.Sandbox) {
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+FROM alpine AS base
+WORKDIR /test
+RUN <<eot
+	set -ex
+	mkdir -p a/b/c/d/e
+	touch a/b/c/d/foo
+	touch a/b/c/d/e/bay
+eot
+
+FROM alpine AS normal
+COPY --from=base --parents /test/a/b/c/d /out/
+RUN <<eot
+	set -ex
+	[ -d /out/test/a/b/c/d/e ]
+	[ -f /out/test/a/b/c/d/e/bay ]
+	[ ! -d /out/e ]
+	[ ! -d /out/a ]
+eot
+
+FROM alpine AS withpivot
+COPY --from=base --parents /test/a/b/./c/d /out/
+RUN <<eot
+	set -ex
+	[ -d /out/c/d/e ]
+	[ -f /out/c/d/foo ]
+	[ ! -d /out/a ]
+	[ ! -d /out/e ]
+eot
+
+FROM alpine AS nonexistentfile
+COPY --from=base --parents /test/nonexistent-file /out/
+
+FROM alpine AS wildcard-nonexistent
+COPY --from=base --parents /test/a/b2*/c /out/
+RUN <<eot
+	set -ex
+	[ -d /out ]
+	[ ! -d /out/a ]
+eot
+
+FROM alpine AS wildcard-afterpivot
+COPY --from=base --parents /test/a/b/./c2* /out/
+RUN <<eot
+	set -ex
+	[ -d /out ]
+	[ ! -d /out/a ]
+	[ ! -d /out/c* ]
+eot
+`,
+		`
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS base
+WORKDIR /test
+RUN mkdir a && mkdir a\b && mkdir a\b\c && mkdir a\b\c\d && mkdir a\b\c\d\e
+RUN cmd /C "echo. > a\b\c\d\foo"
+RUN cmd /C "echo. > a\b\c\d\e\bay"
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS normal
+COPY --from=base --parents /test/a/b/c/d /out/
+RUN if not exist \out\test\a\b\c\d\e exit /b 1
+RUN if not exist \out\test\a\b\c\d\e\bay exit /b 1
+RUN if exist \out\e exit /b 1
+RUN if exist \out\a exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS withpivot
+COPY --from=base --parents /test/a/b/./c/d /out/
+RUN if not exist \out\c\d\e exit /b 1
+RUN if not exist \out\c\d\foo exit /b 1
+RUN if exist \out\a exit /b 1
+RUN if exist \out\e exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS nonexistentfile
+COPY --from=base --parents /test/nonexistent-file /out/
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS wildcard-nonexistent
+COPY --from=base --parents /test/a/b2*/c /out/
+RUN if not exist \out exit /b 1
+RUN if exist \out\a exit /b 1
+
+FROM mcr.microsoft.com/windows/nanoserver:ltsc2022 AS wildcard-afterpivot
+COPY --from=base --parents /test/a/b/./c2* /out/
+RUN if not exist \out exit /b 1
+RUN if exist \out\a exit /b 1
+RUN if exist \out\c exit /b 1
+`,
+	))
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	type test struct {
+		target     string
+		errorRegex any
+	}
+
+	tests := []test{
+		{"normal", nil},
+		{"withpivot", nil},
+		{"nonexistentfile", `failed to calculate checksum of ref.*: "/test/nonexistent-file": not found`},
+		{"wildcard-nonexistent", nil},
+		{"wildcard-afterpivot", nil},
+	}
+
+	for _, tt := range tests {
+		t.Logf("target: %s", tt.target)
+		_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+			FrontendAttrs: map[string]string{
+				"target": tt.target,
+			},
+			LocalMounts: map[string]fsutil.FS{
+				dockerui.DefaultLocalNameDockerfile: dir,
+				dockerui.DefaultLocalNameContext:    dir,
+			},
+		}, nil)
+
+		if tt.errorRegex != nil {
+			require.Error(t, err)
+			require.Regexp(t, tt.errorRegex, err.Error())
+		} else {
+			require.NoError(t, err)
+		}
 	}
 }

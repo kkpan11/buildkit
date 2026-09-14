@@ -3,7 +3,6 @@ package dockerfile
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
@@ -23,17 +22,19 @@ var outlineTests = integration.TestFuncs(
 	testOutlineArgs,
 	testOutlineSecrets,
 	testOutlineDescribeDefinition,
+	testOutlineRecursiveArgs,
 )
 
 func testOutlineArgs(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureFrontendOutline)
 	f := getFrontend(t, sb)
 	if _, ok := f.(*clientFrontend); !ok {
 		t.Skip("only test with client frontend")
 	}
 
-	dockerfile := []byte(`ARG inherited=box
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
+ARG inherited=box
 ARG inherited2=box2
 ARG unused=abc${inherited2}
 # sfx is a suffix
@@ -52,26 +53,60 @@ RUN true
 
 FROM scratch AS third
 ARG ABC=a
+# check=skip=all
+ARG password
+# alternate_password will show up in the outline
+# check=skip=all
+ARG alternate_password
 
 # target defines build target
 FROM third AS target
 COPY --from=first /etc/passwd /
 
 FROM second
-`)
+`,
+		`
+ARG inherited=server
+ARG inherited2=server2
+ARG unused=abc${inherited2}
+# sfx is a suffix
+ARG sfx="ano${inherited}"
+
+FROM n${sfx} AS first
+# this is not assigned to anything
+ARG FOO=123
+# BAR is a number
+ARG BAR=456
+RUN exit 0
+
+FROM nanoserver${unused} AS second
+ARG BAZ
+RUN exit 0
+
+FROM nanoserver AS third
+ARG ABC=a
+# check=skip=all
+ARG password
+# alternate_password will show up in the outline
+# check=skip=all
+ARG alternate_password
+
+# target defines build target
+FROM third AS target
+COPY --from=first /License.txt /license
+
+FROM second
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
-
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
 
 	called := false
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
@@ -95,26 +130,26 @@ FROM second
 		require.Equal(t, 1, len(outline.Sources))
 		require.Equal(t, dockerfile, outline.Sources[0])
 
-		require.Equal(t, 5, len(outline.Args))
+		require.Equal(t, 7, len(outline.Args))
 
 		arg := outline.Args[0]
 		require.Equal(t, "inherited", arg.Name)
-		require.Equal(t, "box", arg.Value)
+		require.Equal(t, integration.UnixOrWindows("box", "server"), arg.Value)
 		require.Equal(t, "", arg.Description)
 		require.Equal(t, int32(0), arg.Location.SourceIndex)
-		require.Equal(t, int32(1), arg.Location.Ranges[0].Start.Line)
+		require.Equal(t, int32(2), arg.Location.Ranges[0].Start.Line)
 
 		arg = outline.Args[1]
 		require.Equal(t, "sfx", arg.Name)
-		require.Equal(t, "usybox", arg.Value)
+		require.Equal(t, integration.UnixOrWindows("usybox", "anoserver"), arg.Value)
 		require.Equal(t, "is a suffix", arg.Description)
-		require.Equal(t, int32(5), arg.Location.Ranges[0].Start.Line)
+		require.Equal(t, int32(6), arg.Location.Ranges[0].Start.Line)
 
 		arg = outline.Args[2]
 		require.Equal(t, "FOO", arg.Name)
 		require.Equal(t, "123", arg.Value)
 		require.Equal(t, "", arg.Description)
-		require.Equal(t, int32(9), arg.Location.Ranges[0].Start.Line)
+		require.Equal(t, int32(10), arg.Location.Ranges[0].Start.Line)
 
 		arg = outline.Args[3]
 		require.Equal(t, "BAR", arg.Name)
@@ -124,6 +159,18 @@ FROM second
 		arg = outline.Args[4]
 		require.Equal(t, "ABC", arg.Name)
 		require.Equal(t, "a", arg.Value)
+
+		arg = outline.Args[5]
+		require.Equal(t, "password", arg.Name)
+		require.Equal(t, "", arg.Value)
+		require.Equal(t, "", arg.Description)
+		require.Equal(t, int32(22), arg.Location.Ranges[0].Start.Line)
+
+		arg = outline.Args[6]
+		require.Equal(t, "alternate_password", arg.Name)
+		require.Equal(t, "", arg.Value)
+		require.Equal(t, "will show up in the outline", arg.Description)
+		require.Equal(t, int32(25), arg.Location.Ranges[0].Start.Line)
 
 		called = true
 		return nil, nil
@@ -139,15 +186,28 @@ FROM second
 	require.True(t, called)
 }
 
+// testOutlineSecrets checks that BuildKit can look at a Dockerfile and correctly
+// list the secrets and SSH mounts that a given build target needs.
+//
+// The outline feature only reads the Dockerfile — it never actually runs the build.
+// So this test makes sure that:
+//   - Only secrets/SSH used by the target stage (and its dependencies) are listed.
+//     Secrets and SSH declared in unrelated stages are ignored.
+//   - Each secret and SSH entry has the right name, required flag, and line number.
+//   - Build args inside mount ids (like id=second${BAR}) get expanded correctly.
+//
+// Because nothing is executed, the Linux and Windows versions of the Dockerfile
+// only differ in cosmetic ways (base images and the dummy command). The line
+// numbers are kept identical so the same assertions work on both platforms.
 func testOutlineSecrets(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureFrontendOutline)
 	f := getFrontend(t, sb)
 	if _, ok := f.(*clientFrontend); !ok {
 		t.Skip("only test with client frontend")
 	}
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM busybox AS first
 RUN --mount=type=secret,target=/etc/passwd,required=true --mount=type=ssh true
 
@@ -163,20 +223,34 @@ COPY --from=first /foo /
 RUN --mount=type=ssh,id=ssh3,required true
 
 FROM second
-`)
+`,
+		`
+FROM nanoserver AS first
+RUN --mount=type=secret,target=/etc/passwd,required=true --mount=type=ssh exit 0
+
+FROM nanoserver AS second
+RUN --mount=type=secret,id=unused,target=C:/unused --mount=type=ssh,id=ssh2 exit 0
+
+FROM nanoserver AS third
+ARG BAR
+RUN --mount=type=secret,id=second${BAR},target=C:/second exit 0
+
+FROM third AS target
+COPY --from=first /License.txt /
+RUN --mount=type=ssh,id=ssh3,required exit 0
+
+FROM second
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
-		fstest.CreateFile("Dockerfile", []byte(dockerfile), 0600),
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
-
-	destDir, err := os.MkdirTemp("", "buildkit")
-	require.NoError(t, err)
-	defer os.RemoveAll(destDir)
 
 	called := false
 	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
@@ -239,8 +313,82 @@ FROM second
 	require.True(t, called)
 }
 
+func testOutlineRecursiveArgs(t *testing.T, sb integration.Sandbox) {
+	workers.CheckFeatureCompat(t, sb, workers.FeatureFrontendOutline)
+	f := getFrontend(t, sb)
+	if _, ok := f.(*clientFrontend); !ok {
+		t.Skip("only test with client frontend")
+	}
+
+	dockerfile := []byte(`
+ARG FOO=123
+ARG ABC=abc
+ARG DEF=def
+ARG FOO=${FOO}${ABC}
+ARG BAR=${FOO}456
+ARG FOO=${FOO}456${BAR}
+FROM scratch
+ARG FOO
+ARG INFOO=123
+ARG INBAR=${INFOO}456
+ARG INFOO=${INFOO}456${INBAR}
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	called := false
+	frontend := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+		res, err := c.Solve(ctx, gateway.SolveRequest{
+			FrontendOpt: map[string]string{
+				"frontend.caps": "moby.buildkit.frontend.subrequests",
+				"requestid":     "frontend.outline",
+			},
+			Frontend: "dockerfile.v0",
+		})
+		require.NoError(t, err)
+
+		outline, err := unmarshalOutline(res)
+		require.NoError(t, err)
+
+		require.Len(t, outline.Args, 5)
+
+		require.Equal(t, "ABC", outline.Args[0].Name)
+		require.Equal(t, "abc", outline.Args[0].Value)
+
+		require.Equal(t, "BAR", outline.Args[1].Name)
+		require.Equal(t, "123abc456", outline.Args[1].Value)
+
+		require.Equal(t, "FOO", outline.Args[2].Name)
+		require.Equal(t, "123abc456123abc456", outline.Args[2].Value)
+
+		require.Equal(t, "INBAR", outline.Args[3].Name)
+		require.Equal(t, "123456", outline.Args[3].Value)
+
+		require.Equal(t, "INFOO", outline.Args[4].Name)
+		require.Equal(t, "123456123456", outline.Args[4].Value)
+
+		called = true
+		return nil, nil
+	}
+
+	_, err = c.Build(sb.Context(), client.SolveOpt{
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+		},
+	}, "", frontend, nil)
+	require.NoError(t, err)
+
+	require.True(t, called)
+}
+
 func testOutlineDescribeDefinition(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	workers.CheckFeatureCompat(t, sb, workers.FeatureFrontendOutline)
 	f := getFrontend(t, sb)
 	if _, ok := f.(*clientFrontend); !ok {
@@ -251,10 +399,16 @@ func testOutlineDescribeDefinition(t *testing.T, sb integration.Sandbox) {
 	require.NoError(t, err)
 	defer c.Close()
 
-	dockerfile := []byte(`
+	dockerfile := []byte(integration.UnixOrWindows(
+		`
 FROM scratch
 COPY Dockerfile Dockerfile
-`)
+`,
+		`
+FROM nanoserver
+COPY Dockerfile Dockerfile
+`,
+	))
 
 	dir := integration.Tmpdir(
 		t,
@@ -298,7 +452,7 @@ COPY Dockerfile Dockerfile
 func unmarshalOutline(res *gateway.Result) (*outline.Outline, error) {
 	dt, ok := res.Metadata["result.json"]
 	if !ok {
-		return nil, errors.Errorf("missing frontend.outline")
+		return nil, errors.New("missing frontend.outline")
 	}
 	var o outline.Outline
 	if err := json.Unmarshal(dt, &o); err != nil {

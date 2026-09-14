@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/namespaces"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
@@ -46,9 +47,13 @@ func testBuildWithLocalFiles(t *testing.T, sb integration.Sandbox) {
 }
 
 func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
-	st := llb.Image("busybox").
-		Run(llb.Shlex("sh -c 'echo -n bar > /out/foo'"))
+	img := integration.UnixOrWindows("busybox", "nanoserver:latest")
+	cmdStr := integration.UnixOrWindows(
+		"sh -c 'echo -n bar > /out/foo'",
+		`cmd /c "echo bar > C:/out/foo"`,
+	)
+
+	st := llb.Image(img).Run(llb.Shlex(cmdStr))
 
 	out := st.AddMount("/out", llb.Scratch())
 
@@ -65,18 +70,25 @@ func testBuildLocalExporter(t *testing.T, sb integration.Sandbox) {
 
 	dt, err := os.ReadFile(filepath.Join(tmpdir, "foo"))
 	require.NoError(t, err)
-	require.Equal(t, "bar", string(dt))
+
+	// in windows plain echo in cmd.exe will always append \r\n (CRLF)
+	actualContent := integration.UnixOrWindows(string(dt), strings.TrimSpace(string(dt)))
+	require.Equal(t, "bar", actualContent)
 }
 
 func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
 	cdAddress := sb.ContainerdAddress()
 	if cdAddress == "" {
 		t.Skip("test is only for containerd worker")
 	}
 
-	st := llb.Image("busybox").
-		Run(llb.Shlex("sh -c 'echo -n bar > /foo'"))
+	baseImg := integration.UnixOrWindows("busybox", "nanoserver:latest")
+	cmdStr := integration.UnixOrWindows(
+		"sh -c 'echo -n bar > /foo'",
+		`cmd /c "echo bar > C:/foo"`,
+	)
+
+	st := llb.Image(baseImg).Run(llb.Shlex(cmdStr))
 
 	rdr, err := marshal(sb.Context(), st.Root())
 	require.NoError(t, err)
@@ -93,17 +105,17 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 	err = cmd.Run()
 	require.NoError(t, err)
 
-	client, err := containerd.New(cdAddress, containerd.WithTimeout(60*time.Second))
+	client, err := ctd.New(cdAddress, ctd.WithTimeout(60*time.Second))
 	require.NoError(t, err)
 	defer client.Close()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit")
 
 	img, err := client.GetImage(ctx, imageName)
 	require.NoError(t, err)
 
-	// NOTE: by default, it is overlayfs
-	snapshotter := "overlayfs"
+	// NOTE: by default, it is overlayfs on Linux, windows on Windows
+	snapshotter := integration.UnixOrWindows("overlayfs", "windows")
 	if sn := sb.Snapshotter(); sn != "" {
 		snapshotter = sn
 	}
@@ -113,9 +125,13 @@ func testBuildContainerdExporter(t *testing.T, sb integration.Sandbox) {
 }
 
 func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
-	integration.SkipOnPlatform(t, "windows")
-	st := llb.Image("busybox").
-		Run(llb.Shlex("sh -c 'echo -n bar > /foo'"))
+	img := integration.UnixOrWindows("busybox", "nanoserver:latest")
+	cmdStr := integration.UnixOrWindows(
+		"sh -c 'echo -n bar > /foo'",
+		`cmd /c "echo bar > C:/foo"`,
+	)
+
+	st := llb.Image(img).Run(llb.Shlex(cmdStr))
 
 	rdr, err := marshal(sb.Context(), st.Root())
 	require.NoError(t, err)
@@ -140,12 +156,12 @@ func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
 	metadataBytes, err := os.ReadFile(metadataFile)
 	require.NoError(t, err)
 
-	var metadata map[string]interface{}
+	var metadata map[string]any
 	err = json.Unmarshal(metadataBytes, &metadata)
 	require.NoError(t, err)
 
-	require.Contains(t, metadata, "image.name")
-	require.Equal(t, imageName, metadata["image.name"])
+	require.Contains(t, metadata, exptypes.ExporterImageNameKey)
+	require.Equal(t, imageName, metadata[exptypes.ExporterImageNameKey])
 
 	require.Contains(t, metadata, exptypes.ExporterImageDigestKey)
 	digest := metadata[exptypes.ExporterImageDigestKey]
@@ -164,17 +180,39 @@ func testBuildMetadataFile(t *testing.T, sb integration.Sandbox) {
 	if cdAddress == "" {
 		t.Log("no containerd worker, skipping digest verification")
 	} else {
-		client, err := containerd.New(cdAddress, containerd.WithTimeout(60*time.Second))
+		client, err := ctd.New(cdAddress, ctd.WithTimeout(60*time.Second))
 		require.NoError(t, err)
 		defer client.Close()
 
-		ctx := namespaces.WithNamespace(context.Background(), "buildkit")
+		ctx := namespaces.WithNamespace(t.Context(), "buildkit")
 
 		img, err := client.GetImage(ctx, imageName)
 		require.NoError(t, err)
 
 		require.Equal(t, img.Metadata().Target.Digest.String(), digest)
 	}
+}
+
+func testBuildPushProgress(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	registry, err := sb.NewRegistry()
+	if errors.Is(err, integration.ErrRequirements) {
+		t.Skip(err.Error())
+	}
+	require.NoError(t, err)
+
+	st := llb.Scratch().File(llb.Mkfile("foo", 0600, []byte("data")))
+	rdr, err := marshal(sb.Context(), st)
+	require.NoError(t, err)
+
+	imageName := registry + "/foo/bar:latest"
+	cmd := sb.Cmd("build", "--progress=plain", "--output", "type=image,name="+imageName+",push=true")
+	cmd.Stdin = rdr
+
+	dt, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(dt))
+	require.Contains(t, string(dt), "pushing layers")
+	require.Contains(t, string(dt), "pushing manifest for "+imageName+"@")
 }
 
 func marshal(ctx context.Context, st llb.State) (io.Reader, error) {

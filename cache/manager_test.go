@@ -18,19 +18,19 @@ import (
 	"testing"
 	"time"
 
-	ctdcompression "github.com/containerd/containerd/archive/compression"
-	"github.com/containerd/containerd/archive/tarheader"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/diff/apply"
-	"github.com/containerd/containerd/diff/walking"
-	"github.com/containerd/containerd/labels"
-	"github.com/containerd/containerd/leases"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/snapshots"
-	"github.com/containerd/containerd/snapshots/native"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff/apply"
+	"github.com/containerd/containerd/v2/core/leases"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	ctdcompression "github.com/containerd/containerd/v2/pkg/archive/compression"
+	"github.com/containerd/containerd/v2/pkg/archive/tarheader"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/containerd/v2/plugins/diff/walking"
+	"github.com/containerd/containerd/v2/plugins/snapshots/native"
 	"github.com/containerd/continuity/fs/fstest"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/stargz-snapshotter/estargz"
@@ -45,6 +45,7 @@ import (
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/converter"
+	"github.com/moby/buildkit/util/disk"
 	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/leaseutil"
 	"github.com/moby/buildkit/util/overlay"
@@ -67,12 +68,15 @@ type cmOut struct {
 	manager Manager
 	lm      leases.Manager
 	cs      content.Store
+	// testSnapshotter bypasses the namespaced wrapper and must only be used by
+	// tests that need to simulate out-of-band snapshotter changes.
+	testSnapshotter snapshots.Snapshotter
 }
 
 func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, cleanup func(), err error) {
 	ns, ok := namespaces.Namespace(ctx)
 	if !ok {
-		return nil, nil, errors.Errorf("namespace required for test")
+		return nil, nil, errors.New("namespace required for test")
 	}
 
 	if opt.snapshotterName == "" {
@@ -125,7 +129,7 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 	mdb := ctdmetadata.NewDB(db, store, map[string]snapshots.Snapshotter{
 		opt.snapshotterName: opt.snapshotter,
 	})
-	if err := mdb.Init(context.TODO()); err != nil {
+	if err := mdb.Init(t.Context()); err != nil {
 		return nil, nil, err
 	}
 
@@ -143,14 +147,16 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 		return md.Close()
 	})
 
+	metadataSnapshotter := mdb.Snapshotter(opt.snapshotterName)
 	cm, err := NewManager(ManagerOpt{
-		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, mdb.Snapshotter(opt.snapshotterName)), nil),
+		Snapshotter:    snapshot.FromContainerdSnapshotter(opt.snapshotterName, containerdsnapshot.NSSnapshotter(ns, metadataSnapshotter), nil),
 		MetadataStore:  md,
 		ContentStore:   store,
 		LeaseManager:   lm,
 		GarbageCollect: mdb.GarbageCollect,
 		Applier:        applier,
 		Differ:         differ,
+		Root:           tmpdir,
 		MountPoolRoot:  filepath.Join(tmpdir, "cachemounts"),
 	})
 	if err != nil {
@@ -161,22 +167,24 @@ func newCacheManager(ctx context.Context, t *testing.T, opt cmOpt) (co *cmOut, c
 	})
 
 	return &cmOut{
-		manager: cm,
-		lm:      lm,
-		cs:      store,
+		manager:         cm,
+		lm:              lm,
+		cs:              store,
+		testSnapshotter: metadataSnapshotter,
 	}, cleanup, nil
 }
 
 func TestSharableMountPoolCleanup(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
 	// Emulate the situation where the pool dir is dirty
 	mountPoolDir := filepath.Join(tmpdir, "cachemounts")
 	require.NoError(t, os.MkdirAll(mountPoolDir, 0700))
-	_, err := os.MkdirTemp(mountPoolDir, "buildkit")
+	// not using t.TempDir() here because the dir must be created inside mountPoolDir
+	_, err := os.MkdirTemp(mountPoolDir, "buildkit") //nolint:usetesting
 	require.NoError(t, err)
 
 	// Initialize cache manager and check if pool is cleaned up
@@ -194,7 +202,7 @@ func TestSharableMountPoolCleanup(t *testing.T) {
 func TestManager(t *testing.T) {
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -327,7 +335,7 @@ func TestManager(t *testing.T) {
 
 func TestLazyGetByBlob(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -370,7 +378,7 @@ func TestLazyGetByBlob(t *testing.T) {
 
 func TestMergeBlobchainID(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -389,10 +397,10 @@ func TestMergeBlobchainID(t *testing.T) {
 	var mergeInputs []ImmutableRef
 	var descs []ocispecs.Descriptor
 	descHandlers := DescHandlers(map[digest.Digest]*DescHandler{})
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		contentBuffer := contentutil.NewBuffer()
 		var curBlob ImmutableRef
-		for j := 0; j < 3; j++ {
+		for j := range 3 {
 			blobBytes, desc, err := mapToBlob(map[string]string{strconv.Itoa(i): strconv.Itoa(j)}, true)
 			require.NoError(t, err)
 			cw, err := contentBuffer.Writer(ctx)
@@ -441,7 +449,7 @@ func TestSnapshotExtract(t *testing.T) {
 	}
 
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -516,7 +524,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	id := snap.ID()
 
-	err = snap.Release(context.TODO())
+	err = snap.Release(t.Context())
 	require.NoError(t, err)
 
 	buf = pruneResultBuffer()
@@ -535,7 +543,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkDiskUsage(ctx, t, cm, 2, 0)
 
-	err = snap2.Release(context.TODO())
+	err = snap2.Release(t.Context())
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 1, 1)
@@ -555,7 +563,7 @@ func TestSnapshotExtract(t *testing.T) {
 
 	checkNumBlobs(ctx, t, co.cs, 1)
 
-	err = snap.Release(context.TODO())
+	err = snap.Release(t.Context())
 	require.NoError(t, err)
 
 	buf = pruneResultBuffer()
@@ -572,13 +580,63 @@ func TestSnapshotExtract(t *testing.T) {
 	checkNumBlobs(ctx, t, co.cs, 0)
 }
 
+func TestMissingMaterializedLowerDiffExtract(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
+
+	co, cleanup, err := newCacheManager(ctx, t, cmOpt{})
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	cm := co.manager
+
+	var refs []ImmutableRef
+	for i, files := range []map[string]string{
+		{"lower": "lower"},
+		{"upper": "upper"},
+	} {
+		blob, desc, err := mapToBlob(files, true)
+		require.NoError(t, err)
+		require.NoError(t, content.WriteBlob(ctx, co.cs, fmt.Sprintf("missing-snapshot-%d", i), bytes.NewBuffer(blob), desc))
+
+		ref, err := cm.GetByBlob(ctx, desc, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			require.NoError(t, ref.Release(context.WithoutCancel(ctx)))
+		})
+		refs = append(refs, ref)
+	}
+
+	require.NoError(t, refs[0].Extract(ctx, nil))
+	require.NoError(t, refs[1].Extract(ctx, nil))
+	require.False(t, refs[0].(*immutableRef).getBlobOnly())
+	diff, err := cm.Diff(ctx, refs[0], refs[1], nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, diff.Release(context.WithoutCancel(ctx)))
+	})
+
+	lowerID := refs[0].(*immutableRef).getSnapshotID()
+	require.NoError(t, co.testSnapshotter.Remove(ctx, lowerID))
+
+	_, err = co.testSnapshotter.Stat(ctx, lowerID)
+	require.ErrorIs(t, err, cerrdefs.ErrNotFound)
+
+	require.NoError(t, diff.Extract(ctx, nil))
+	_, err = co.testSnapshotter.Stat(ctx, lowerID)
+	require.NoError(t, err)
+}
+
 func TestExtractOnMutable(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
 	}
 
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -619,7 +677,7 @@ func TestExtractOnMutable(t *testing.T) {
 	require.NoError(t, err)
 
 	err = snap.(*immutableRef).setBlob(leaseCtx, desc)
-	done(context.TODO())
+	done(t.Context())
 	require.NoError(t, err)
 	err = snap.(*immutableRef).computeChainMetadata(leaseCtx, map[string]struct{}{snap.ID(): {}})
 	require.NoError(t, err)
@@ -627,7 +685,7 @@ func TestExtractOnMutable(t *testing.T) {
 	snap2, err := cm.GetByBlob(ctx, desc2, snap)
 	require.NoError(t, err)
 
-	err = snap.Release(context.TODO())
+	err = snap.Release(t.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, false, !snap2.(*immutableRef).getBlobOnly())
@@ -661,7 +719,7 @@ func TestExtractOnMutable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, len(dirs))
 
-	err = snap2.Release(context.TODO())
+	err = snap2.Release(t.Context())
 	require.NoError(t, err)
 
 	checkDiskUsage(ctx, t, cm, 0, 2)
@@ -684,7 +742,7 @@ func TestExtractOnMutable(t *testing.T) {
 
 func TestSetBlob(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -703,7 +761,7 @@ func TestSetBlob(t *testing.T) {
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
-	defer done(context.TODO())
+	defer done(t.Context())
 
 	cm := co.manager
 
@@ -722,7 +780,7 @@ func TestSetBlob(t *testing.T) {
 
 	ctx, clean, err := leaseutil.WithLease(ctx, co.lm)
 	require.NoError(t, err)
-	defer clean(context.TODO())
+	defer clean(t.Context())
 
 	b, desc, err := mapToBlob(map[string]string{"foo": "bar"}, true)
 	require.NoError(t, err)
@@ -850,14 +908,14 @@ func TestSetBlob(t *testing.T) {
 	}, snap3)
 	require.Error(t, err)
 
-	clean(context.TODO())
+	clean(t.Context())
 
 	// snap.SetBlob()
 }
 
 func TestPrune(t *testing.T) {
 	t.Parallel()
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -969,7 +1027,7 @@ func TestPrune(t *testing.T) {
 func TestLazyCommit(t *testing.T) {
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1128,7 +1186,7 @@ func TestLoopLeaseContent(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1192,7 +1250,7 @@ func TestLoopLeaseContent(t *testing.T) {
 	gotChain := []digest.Digest{orgDesc.Digest}
 	cur := orgDesc
 	previous := chain[len(chain)-1].Digest
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		dgst := cur.Digest
 		visited[dgst] = struct{}{}
 		info, err := co.cs.Info(ctx, dgst)
@@ -1243,7 +1301,7 @@ func TestSharingCompressionVariant(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1278,7 +1336,7 @@ func TestSharingCompressionVariant(t *testing.T) {
 		}
 	}
 
-	t.Logf("Test cases with possible compression types")
+	t.Log("Test cases with possible compression types")
 	do(func(testCase testCaseSharingCompressionVariant) {
 		testCase.checkPrune = true
 		testSharingCompressionVariant(ctx, t, co, testCase)
@@ -1286,7 +1344,7 @@ func TestSharingCompressionVariant(t *testing.T) {
 		checkDiskUsage(ctx, t, co.manager, 0, 0)
 	})
 
-	t.Logf("Test case with many parallel operation")
+	t.Log("Test case with many parallel operation")
 	eg, egctx := errgroup.WithContext(ctx)
 	do(func(testCase testCaseSharingCompressionVariant) {
 		eg.Go(func() error {
@@ -1407,7 +1465,7 @@ func testSharingCompressionVariant(ctx context.Context, t *testing.T, co *cmOut,
 			checkCompression(bDesc, c)
 		}
 
-		// check if compression variables are availalbe on B still after A is released
+		// check if compression variables are available on B still after A is released
 		if testCase.checkPrune && aRef.ID() != bRef.ID() {
 			require.NoError(t, aRef.Release(ctx))
 			ensurePrune(ctx, t, cm, 1, 10)
@@ -1462,7 +1520,7 @@ func getCompressor(w io.Writer, compressionType compression.Type, customized boo
 	case compression.Gzip:
 		if customized {
 			gz, _ := gzip.NewWriterLevel(w, gzip.NoCompression)
-			gz.Header.Comment = "hello"
+			gz.Comment = "hello"
 			gz.Close()
 		}
 		return gzip.NewWriter(w), nil
@@ -1509,7 +1567,7 @@ func TestConversion(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1604,7 +1662,7 @@ func TestGetRemotes(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1621,7 +1679,7 @@ func TestGetRemotes(t *testing.T) {
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
-	defer done(context.TODO())
+	defer done(t.Context())
 
 	contentBuffer := contentutil.NewBuffer()
 
@@ -1630,7 +1688,7 @@ func TestGetRemotes(t *testing.T) {
 	// make some lazy refs from blobs
 	expectedContent := map[digest.Digest]struct{}{}
 	var descs []ocispecs.Descriptor
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		blobmap := map[string]string{"foo": strconv.Itoa(i)}
 		blobBytes, desc, err := mapToBlob(blobmap, true)
 		require.NoError(t, err)
@@ -1668,10 +1726,10 @@ func TestGetRemotes(t *testing.T) {
 	require.NoError(t, err)
 
 	refs := []ImmutableRef{lazyRef}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		var newRefs []ImmutableRef
 		for j, ir := range refs {
-			for k := 0; k < 2; k++ {
+			for k := range 2 {
 				mutRef, err := cm.New(ctx, ir, nil, descHandlers)
 				require.NoError(t, err)
 
@@ -1726,13 +1784,15 @@ func TestGetRemotes(t *testing.T) {
 
 	// Call GetRemotes on all the refs
 	eg, egctx := errgroup.WithContext(ctx)
+	var testMu sync.RWMutex
 	for _, ir := range refs {
 		ir := ir.(*immutableRef)
 		for _, compressionType := range []compression.Type{compression.Uncompressed, compression.Gzip, compression.EStargz, compression.Zstd} {
-			compressionType := compressionType
 			refCfg := config.RefConfig{Compression: compression.New(compressionType).SetForce(true)}
 			eg.Go(func() error {
+				testMu.RLock()
 				remotes, err := ir.GetRemotes(egctx, true, refCfg, false, nil)
+				testMu.RUnlock()
 				require.NoError(t, err)
 				require.Equal(t, 1, len(remotes))
 				remote := remotes[0]
@@ -1746,7 +1806,7 @@ func TestGetRemotes(t *testing.T) {
 					case compression.EStargz:
 						require.Equal(t, ocispecs.MediaTypeImageLayerGzip, desc.MediaType)
 					case compression.Zstd:
-						require.Equal(t, ocispecs.MediaTypeImageLayer+"+zstd", desc.MediaType)
+						require.Equal(t, ocispecs.MediaTypeImageLayerZstd, desc.MediaType)
 					default:
 						require.Fail(t, "unhandled media type", compressionType)
 					}
@@ -1769,22 +1829,26 @@ func TestGetRemotes(t *testing.T) {
 					variantsMap[ir.ID()][i][compressionType] = desc
 					variantsMapMu.Unlock()
 
-					r := refChain[i]
-					isLazy, err := r.isLazy(egctx)
-					require.NoError(t, err)
-					needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
-					require.NoError(t, err)
-					if needs {
-						require.False(t, isLazy, "layer %q requires conversion so it must be unlazied", desc.Digest)
-					}
-					bDesc, err := r.getBlobWithCompression(egctx, compressionType)
-					if isLazy {
-						require.Error(t, err)
-					} else {
+					func() {
+						testMu.Lock()
+						defer testMu.Unlock()
+						r := refChain[i]
+						isLazy, err := r.isLazy(egctx)
 						require.NoError(t, err)
-						checkDescriptor(ctx, t, co.cs, bDesc, compressionType)
-						require.Equal(t, desc.Digest, bDesc.Digest)
-					}
+						needs, err := compressionType.NeedsConversion(ctx, co.cs, desc)
+						require.NoError(t, err)
+						if needs {
+							require.False(t, isLazy, "layer %q requires conversion so it must be unlazied", desc.Digest)
+						}
+						bDesc, err := r.getBlobWithCompression(egctx, compressionType)
+						if isLazy {
+							require.Error(t, err)
+						} else {
+							require.NoError(t, err)
+							checkDescriptor(ctx, t, co.cs, bDesc, compressionType)
+							require.Equal(t, desc.Digest, bDesc.Digest)
+						}
+					}()
 				}
 				return nil
 			})
@@ -1818,7 +1882,6 @@ func TestGetRemotes(t *testing.T) {
 		variantsMapMu.Unlock()
 		require.True(t, ok, ir.ID())
 		for _, compressionType := range []compression.Type{compression.Uncompressed, compression.Gzip, compression.EStargz, compression.Zstd} {
-			compressionType := compressionType
 			refCfg := config.RefConfig{Compression: compression.New(compressionType)}
 			eg.Go(func() error {
 				remotes, err := ir.GetRemotes(egctx, false, refCfg, true, nil)
@@ -1832,7 +1895,7 @@ func TestGetRemotes(t *testing.T) {
 				require.Equal(t, 1, len(mainOnly))
 				mainRemote := mainOnly[0]
 				require.Equal(t, len(mainRemote.Descriptors), len(gotMain.Descriptors))
-				for i := 0; i < len(mainRemote.Descriptors); i++ {
+				for i := range mainRemote.Descriptors {
 					require.Equal(t, mainRemote.Descriptors[i].Digest, gotMain.Descriptors[i].Digest)
 				}
 
@@ -1875,7 +1938,6 @@ func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVari
 	// check the lowers as well
 	eg, egctx := errgroup.WithContext(ctx)
 	for _, lowers := range got {
-		lowers := lowers
 		eg.Go(func() error {
 			checkVariantsCoverage(egctx, t, variants, idx-1, lowers, nil) // expect all compression variants
 			return nil
@@ -1902,7 +1964,7 @@ func checkVariantsCoverage(ctx context.Context, t *testing.T, variants idxToVari
 func TestNondistributableBlobs(t *testing.T) {
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -1920,7 +1982,7 @@ func TestNondistributableBlobs(t *testing.T) {
 
 	ctx, done, err := leaseutil.WithLease(ctx, co.lm, leaseutil.MakeTemporary)
 	require.NoError(t, err)
-	defer done(context.TODO())
+	defer done(t.Context())
 
 	contentBuffer := contentutil.NewBuffer()
 	descHandlers := DescHandlers(map[digest.Digest]*DescHandler{})
@@ -2031,7 +2093,7 @@ func TestMergeOp(t *testing.T) {
 	// Tests for the fs merge logic are in client_test and snapshotter_test.
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2051,7 +2113,7 @@ func TestMergeOp(t *testing.T) {
 	require.Nil(t, emptyMerge)
 
 	var baseRefs []ImmutableRef
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		active, err := cm.New(ctx, nil, nil)
 		require.NoError(t, err)
 		m, err := active.Mount(ctx, false, nil)
@@ -2149,7 +2211,7 @@ func TestDiffOp(t *testing.T) {
 	// Tests for the fs diff logic are in client_test and snapshotter_test.
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2251,7 +2313,7 @@ func TestLoadHalfFinalizedRef(t *testing.T) {
 	// removed and the immutable ref will continue to be usable.
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2332,7 +2394,7 @@ func TestMountReadOnly(t *testing.T) {
 		t.Skipf("unsupported GOOS: %s", runtime.GOOS)
 	}
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2350,7 +2412,7 @@ func TestMountReadOnly(t *testing.T) {
 	mutRef, err := cm.New(ctx, nil, nil)
 	require.NoError(t, err)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		rwMntable, err := mutRef.Mount(ctx, false, nil)
 		require.NoError(t, err)
 		rwMnts, release, err := rwMntable.Mount()
@@ -2398,7 +2460,7 @@ func TestLoadBrokenParents(t *testing.T) {
 	// of other parent refs
 	t.Parallel()
 
-	ctx := namespaces.WithNamespace(context.Background(), "buildkit-test")
+	ctx := namespaces.WithNamespace(t.Context(), "buildkit-test")
 
 	tmpdir := t.TempDir()
 
@@ -2450,6 +2512,134 @@ func TestLoadBrokenParents(t *testing.T) {
 	refA, err = cm.Get(ctx, refAID, nil)
 	require.NoError(t, err)
 	require.Len(t, refA.(*immutableRef).refs, 1)
+}
+
+func TestCalculateKeepBytes(t *testing.T) {
+	ts := []struct {
+		name      string
+		totalSize int64
+		stat      disk.DiskStat
+		opt       client.PruneInfo
+		result    int64
+	}{
+		{
+			name:      "empty",
+			totalSize: 1000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  9000,
+			},
+			opt:    client.PruneInfo{},
+			result: 0,
+		},
+		{
+			name:      "only buildkit max",
+			totalSize: 1000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  9000,
+			},
+			opt: client.PruneInfo{
+				MaxUsedSpace: 2000, // 20% of the disk
+			},
+			result: 2000,
+		},
+		{
+			name:      "only buildkit free",
+			totalSize: 7000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  3000,
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace: 5000, // 50% of the disk
+			},
+			result: 5000,
+		},
+		{
+			name:      "only buildkit free with min",
+			totalSize: 7000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  3000,
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 6000, // 60% of the disk,
+			},
+			result: 6000,
+		},
+		{
+			name:      "only buildkit free all",
+			totalSize: 7000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  3000,
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 2000, // 20% of the disk
+				MaxUsedSpace:  4000, // 40% of the disk
+			},
+			result: 4000,
+		},
+		{
+			name:      "mixed max",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MaxUsedSpace: 2000, // 20% of the disk
+			},
+			result: 2000,
+		},
+		{
+			name:      "mixed free",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace: 5000, // 50% of the disk
+			},
+			result: 1000,
+		},
+		{
+			name:      "mixed free with min",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 2000, // 20% of the disk
+			},
+			result: 2000,
+		},
+		{
+			name:      "mixed free all",
+			totalSize: 4000,
+			stat: disk.DiskStat{
+				Total: 10000,
+				Free:  2000, // something else is using 4000
+			},
+			opt: client.PruneInfo{
+				MinFreeSpace:  5000, // 50% of the disk
+				ReservedSpace: 2000, // 20% of the disk
+				MaxUsedSpace:  4000, // 40% of the disk
+			},
+			result: 2000,
+		},
+	}
+	for _, tc := range ts {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.result, calculateKeepBytes(tc.totalSize, tc.stat, tc.opt))
+		})
+	}
 }
 
 func checkDiskUsage(ctx context.Context, t *testing.T, cm Manager, inuse, unused int) {
@@ -2526,14 +2716,6 @@ func (b *buf) close() {
 	<-b.closed
 }
 
-type bufferCloser struct {
-	*bytes.Buffer
-}
-
-func (b bufferCloser) Close() error {
-	return nil
-}
-
 func mapToBlob(m map[string]string, compress bool) ([]byte, ocispecs.Descriptor, error) {
 	if !compress {
 		return mapToBlobWithCompression(m, nil)
@@ -2547,7 +2729,7 @@ func mapToBlobWithCompression(m map[string]string, compress func(io.Writer) (io.
 	buf := bytes.NewBuffer(nil)
 	sha := digest.SHA256.Digester()
 
-	var dest io.WriteCloser = bufferCloser{buf}
+	var dest io.WriteCloser = &iohelper.NopWriteCloser{Writer: buf}
 	mediaType := ocispecs.MediaTypeImageLayer
 	if compress != nil {
 		var err error
@@ -2590,7 +2772,7 @@ func fileToBlob(file *os.File, compress bool) ([]byte, ocispecs.Descriptor, erro
 	buf := bytes.NewBuffer(nil)
 	sha := digest.SHA256.Digester()
 
-	var dest io.WriteCloser = bufferCloser{buf}
+	var dest io.WriteCloser = &iohelper.NopWriteCloser{Writer: buf}
 	if compress {
 		dest = gzip.NewWriter(buf)
 	}
@@ -2649,7 +2831,7 @@ func mapToSystemTarBlob(t *testing.T, m map[string]string) ([]byte, ocispecs.Des
 		}
 	}
 
-	cmd := exec.Command("tar", "-C", tmpdir, "-c", ".")
+	cmd := exec.CommandContext(t.Context(), "tar", "-C", tmpdir, "-c", ".")
 	tarout, err := cmd.Output()
 	if err != nil {
 		return nil, ocispecs.Descriptor{}, err
@@ -2658,7 +2840,7 @@ func mapToSystemTarBlob(t *testing.T, m map[string]string) ([]byte, ocispecs.Des
 	tr := tar.NewReader(bytes.NewReader(tarout))
 	for {
 		h, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -2677,7 +2859,7 @@ func mapToSystemTarBlob(t *testing.T, m map[string]string) ([]byte, ocispecs.Des
 		if err != nil {
 			return nil, ocispecs.Descriptor{}, err
 		}
-		if string(gotV) != string(v) {
+		if string(gotV) != v {
 			return nil, ocispecs.Descriptor{}, errors.Errorf("unexpected contents of %s", h.Name)
 		}
 	}

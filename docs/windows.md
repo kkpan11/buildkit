@@ -45,9 +45,10 @@ You will be asked to restart your machine, do so, and then continue with the res
 1. Start the `containerd` service, if not yet started.
 1. Download and extract:
     ```powershell
-    $version = "v0.13.0-rc2" # specify the release version, v0.13+
+    $url = "https://api.github.com/repos/moby/buildkit/releases/latest"
+    $version = (Invoke-RestMethod -Uri $url -UseBasicParsing).tag_name
     $arch = "amd64" # arm64 binary available too
-    curl.exe -LO https://github.com/moby/buildkit/releases/download/$version/buildkit-$version.windows-$arch.tar.gz
+    curl.exe -fSLO https://github.com/moby/buildkit/releases/download/$version/buildkit-$version.windows-$arch.tar.gz
     # there could be another `.\bin` directory from containerd instructions
     # you can move those
     mv bin bin2
@@ -79,6 +80,27 @@ You will be asked to restart your machine, do so, and then continue with the res
     time="2024-02-26T10:42:16+03:00" level=info msg="running server on //./pipe/buildkitd"
     ```
 
+    **Running `buildkitd` with Hyper-V isolation:**
+
+    Some Windows hosts cannot run process-isolated containers for a base image
+    when the container OS version does not match the host OS version. To make
+    all build containers created by the containerd worker use Hyper-V isolation,
+    start `buildkitd` with:
+
+    ```powershell
+    buildkitd --containerd-worker-hyperv-isolation
+    ```
+
+    The same setting can be configured in `buildkitd.toml`:
+
+    ```toml
+    [worker.containerd]
+      hypervIsolation = true
+    ```
+
+    Hyper-V isolation requires the `Microsoft-Hyper-V` and `Containers`
+    Windows features to be enabled.
+
     **Running `buildkitd` with the CNI:**
 
     Note that the above simple run will not have the networking bit setup;
@@ -93,6 +115,8 @@ You will be asked to restart your machine, do so, and then continue with the res
         --containerd-cni-config-path="C:\Program Files\containerd\cni\conf\0-containerd-nat.conf" `
         --containerd-cni-binary-dir="C:\Program Files\containerd\cni\bin"
     ```
+   
+    > **NOTE:** the above CNI paths are now set by default, you can now just run `buildkitd`.
 
     You can also run `buildkitd` as a _Windows Service_:
 
@@ -103,7 +127,7 @@ You will be asked to restart your machine, do so, and then continue with the res
         --containerd-cni-config-path="C:\Program Files\containerd\cni\conf\0-containerd-nat.conf" `
         --containerd-cni-binary-dir="C:\Program Files\containerd\cni\bin" `
         --debug `
-        --log-file="C:\Windows\Temp\buildkitd.log
+        --log-file="C:\Windows\Temp\buildkitd.log"
     ```
 
     > **NOTE:** the above `log-file` path is just an example, but make sure to set up
@@ -154,6 +178,10 @@ Now that everything is setup, let's build a [simple _hello world_ image](https:/
     This message shows that your installation appears to be working correctly.
     "@
     ```
+
+    > **NOTE:** Writing to a file directly under `C:\` needs extra permissions that are `ContainerAdministrator`.
+    > The `ContainerUser` is default user for `nanoserver` image. See more details at [#4731](https://github.com/moby/buildkit/issues/4731).
+
 1. Build and push to your registry (or set to `push=false`). For Docker Hub, make sure you've done `docker login`. See more details on registry configuration [here](../README.md#imageregistry)
 
     ```powershell
@@ -234,27 +262,31 @@ Below is a simple setup based on the `nat` network that comes by default, with e
 _containers_ and _Hyper-V_ features.
 
 ```powershell
+# get the CNI plugins (binaries)
+$cniPluginVersion = "0.3.1"
+$cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
+mkdir $cniBinDir -Force
+curl.exe -fSLO https://github.com/microsoft/windows-container-networking/releases/download/v$cniPluginVersion/windows-container-networking-cni-amd64-v$cniPluginVersion.zip
+tar xvf windows-container-networking-cni-amd64-v$cniPluginVersion.zip -C $cniBinDir
+
+# NOTE: depending on your host setup, the IPs may change after restart
+# you can only run this script from here to end for a refresh.
+# without downloading the binaries again.
+
+$cniVersion = "1.0.0"
+$cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
+
 $networkName = 'nat'
 # Get-HnsNetwork is available once you have enabled the 'Hyper-V Host Compute Service' feature
 # which must have been done at the Quick setup above
-# Enable-WindowsOptionalFeature -Online -FeatureName containers -All
-# Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All
-# the default one named `nat` should be available
+# Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V, Containers -All
+# the default one named `nat` should be available, except for WS2019, see notes below.
 $natInfo = Get-HnsNetwork -ErrorAction Ignore | Where-Object { $_.Name -eq $networkName }
 if ($null -eq $natInfo) {
     throw "NAT network not found, check if you enabled containers, Hyper-V features and restarted the machine"
 }
 $gateway = $natInfo.Subnets[0].GatewayAddress
 $subnet = $natInfo.Subnets[0].AddressPrefix
-
-$cniConfPath = "$env:ProgramFiles\containerd\cni\conf\0-containerd-nat.conf"
-$cniBinDir = "$env:ProgramFiles\containerd\cni\bin"
-$cniVersion = "0.3.0"
-
-# get the CNI plugins (binaries)
-mkdir $cniBinDir -Force
-curl.exe -LO https://github.com/microsoft/windows-container-networking/releases/download/v$cniVersion/windows-container-networking-cni-amd64-v$cniVersion.zip
-tar xvf windows-container-networking-cni-amd64-v$cniVersion.zip -C $cniBinDir
 
 $natConfig = @"
 {
@@ -277,4 +309,29 @@ $natConfig = @"
 }
 "@
 Set-Content -Path $cniConfPath -Value $natConfig
+# take a look
+cat $cniConfPath
+
+# quick test with nanoserver:ltsc20YY (YMMV)
+$YY = 22
+ctr i pull mcr.microsoft.com/windows/nanoserver:ltsc20$YY
+ctr run --rm --cni mcr.microsoft.com/windows/nanoserver:ltsc20$YY cni-test cmd /C curl -I example.com
+```
+
+> [!NOTE]
+> **Notes for WS2019:**
+> For cases where there is no default NAT network, like in WS2019 or even when you delete one
+> and you would like to recreate. You can set this up with the following:
+
+```powershell
+# Assumption: you have enabled Hyper-V and Containers features and restarted
+# Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V, Containers -All
+
+# get the HNS module that has the New-HnsNetwork function.
+curl.exe -fSLO https://raw.githubusercontent.com/microsoft/SDN/master/Kubernetes/windows/hns.psm1
+Import-Module -Force ./hns.psm1
+
+$adapter = Get-NetAdapter | where { $_.InterfaceDescription -eq 'Microsoft Hyper-V Network Adapter' }
+
+New-HnsNetwork -Type NAT -Name nat -AdapterName $adapter.Name
 ```

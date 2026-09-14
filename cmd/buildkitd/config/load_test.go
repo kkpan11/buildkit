@@ -14,6 +14,7 @@ root = "/foo/bar"
 debug=true
 trace=true
 insecure-entitlements = ["security.insecure"]
+proxyNetwork = true
 
 [gc]
 enabled=true
@@ -42,6 +43,7 @@ foo="bar"
 namespace="non-default"
 platforms=["linux/amd64"]
 address="containerd.sock"
+hypervIsolation=true
 [worker.containerd.runtime]
 name="exotic"
 path="/usr/bin/exotic"
@@ -49,14 +51,18 @@ options.foo="bar"
 [[worker.containerd.gcpolicy]]
 all=true
 filters=["foo==bar"]
-keepBytes=20
+reservedSpace=20
 keepDuration=3600
 [[worker.containerd.gcpolicy]]
-keepBytes="40MB"
+reservedSpace="40MB"
 keepDuration=7200
 [[worker.containerd.gcpolicy]]
-keepBytes="20%"
+reservedSpace="20%"
 keepDuration="24h"
+[[worker.containerd.gcpolicy]]
+reservedSpace="10GB"
+maxUsedSpace="80%"
+minFreeSpace="10%"
 
 [registry."docker.io"]
 mirrors=["hub.docker.io"]
@@ -81,6 +87,7 @@ searchDomains=["example.com"]
 	require.Equal(t, true, cfg.Debug)
 	require.Equal(t, true, cfg.Trace)
 	require.Equal(t, "security.insecure", cfg.Entitlements[0])
+	require.True(t, cfg.ProxyNetwork)
 
 	require.Equal(t, "buildkit.sock", cfg.GRPC.Address[0])
 	require.Equal(t, "debug.sock", cfg.GRPC.DebugAddress)
@@ -104,26 +111,34 @@ searchDomains=["example.com"]
 	require.Nil(t, cfg.Workers.Containerd.Enabled)
 	require.Equal(t, 1, len(cfg.Workers.Containerd.Platforms))
 	require.Equal(t, "containerd.sock", cfg.Workers.Containerd.Address)
+	require.True(t, cfg.Workers.Containerd.HyperVIsolation)
 
 	require.Equal(t, 0, len(cfg.Workers.OCI.GCPolicy))
 	require.Equal(t, "non-default", cfg.Workers.Containerd.Namespace)
 	require.Equal(t, "exotic", cfg.Workers.Containerd.Runtime.Name)
 	require.Equal(t, "/usr/bin/exotic", cfg.Workers.Containerd.Runtime.Path)
 	require.Equal(t, "bar", cfg.Workers.Containerd.Runtime.Options["foo"])
-	require.Equal(t, 3, len(cfg.Workers.Containerd.GCPolicy))
+	require.Equal(t, 4, len(cfg.Workers.Containerd.GCPolicy))
 
 	require.Nil(t, cfg.Workers.Containerd.GC)
 	require.Equal(t, true, cfg.Workers.Containerd.GCPolicy[0].All)
-	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[1].All)
-	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[2].All)
-	require.Equal(t, int64(20), cfg.Workers.Containerd.GCPolicy[0].KeepBytes.Bytes)
-	require.Equal(t, int64(40*1024*1024), cfg.Workers.Containerd.GCPolicy[1].KeepBytes.Bytes)
-	require.Equal(t, int64(20), cfg.Workers.Containerd.GCPolicy[2].KeepBytes.Percentage)
-	require.Equal(t, time.Duration(3600), cfg.Workers.Containerd.GCPolicy[0].KeepDuration.Duration/time.Second)
-	require.Equal(t, time.Duration(7200), cfg.Workers.Containerd.GCPolicy[1].KeepDuration.Duration/time.Second)
-	require.Equal(t, time.Duration(86400), cfg.Workers.Containerd.GCPolicy[2].KeepDuration.Duration/time.Second)
 	require.Equal(t, 1, len(cfg.Workers.Containerd.GCPolicy[0].Filters))
+	require.Equal(t, int64(20), cfg.Workers.Containerd.GCPolicy[0].ReservedSpace.Bytes)
+	require.Equal(t, time.Duration(3600), cfg.Workers.Containerd.GCPolicy[0].KeepDuration.Duration/time.Second)
+
+	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[1].All)
+	require.Equal(t, int64(40*1024*1024), cfg.Workers.Containerd.GCPolicy[1].ReservedSpace.Bytes)
+	require.Equal(t, time.Duration(7200), cfg.Workers.Containerd.GCPolicy[1].KeepDuration.Duration/time.Second)
 	require.Equal(t, 0, len(cfg.Workers.Containerd.GCPolicy[1].Filters))
+
+	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[2].All)
+	require.Equal(t, int64(20), cfg.Workers.Containerd.GCPolicy[2].ReservedSpace.Percentage)
+	require.Equal(t, time.Duration(86400), cfg.Workers.Containerd.GCPolicy[2].KeepDuration.Duration/time.Second)
+
+	require.Equal(t, false, cfg.Workers.Containerd.GCPolicy[3].All)
+	require.Equal(t, int64(10*1024*1024*1024), cfg.Workers.Containerd.GCPolicy[3].ReservedSpace.Bytes)
+	require.Equal(t, int64(80), cfg.Workers.Containerd.GCPolicy[3].MaxUsedSpace.Percentage)
+	require.Equal(t, int64(10), cfg.Workers.Containerd.GCPolicy[3].MinFreeSpace.Percentage)
 
 	require.Equal(t, true, *cfg.Registries["docker.io"].PlainHTTP)
 	require.Equal(t, true, *cfg.Registries["docker.io"].Insecure)
@@ -137,4 +152,31 @@ searchDomains=["example.com"]
 	require.Equal(t, []string{"1.1.1.1", "8.8.8.8"}, cfg.DNS.Nameservers)
 	require.Equal(t, []string{"example.com"}, cfg.DNS.SearchDomains)
 	require.Equal(t, []string{"edns0"}, cfg.DNS.Options)
+}
+
+func TestLoadHistoryMaxEntries(t *testing.T) {
+	tests := []struct {
+		name    string
+		toml    string
+		wantSet bool
+		want    int64
+	}{
+		{name: "unset", toml: "[history]\nmaxAge = 172800\n"},
+		{name: "disabled", toml: "[history]\nmaxEntries = 0\n", wantSet: true, want: 0},
+		{name: "configured", toml: "[history]\nmaxEntries = 12\n", wantSet: true, want: 12},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(bytes.NewBufferString(tc.toml))
+			require.NoError(t, err)
+			require.NotNil(t, cfg.History)
+			if tc.wantSet {
+				require.NotNil(t, cfg.History.MaxEntries)
+				require.Equal(t, tc.want, *cfg.History.MaxEntries)
+			} else {
+				require.Nil(t, cfg.History.MaxEntries)
+			}
+		})
+	}
 }

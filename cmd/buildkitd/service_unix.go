@@ -1,10 +1,9 @@
 //go:build !windows
-// +build !windows
 
 package main
 
 import (
-	"github.com/urfave/cli"
+	"github.com/urfave/cli/v3"
 	"google.golang.org/grpc"
 )
 
@@ -15,7 +14,7 @@ func serviceFlags() []cli.Flag {
 }
 
 // applyPlatformFlags applies platform-specific flags.
-func applyPlatformFlags(context *cli.Context) {
+func applyPlatformFlags(context *cli.Command) {
 }
 
 // registerUnregisterService is only relevant on Windows.

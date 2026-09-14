@@ -1,7 +1,6 @@
 package llb
 
 import (
-	"context"
 	"testing"
 
 	"github.com/moby/buildkit/solver/pb"
@@ -55,6 +54,84 @@ func TestFormattingPatterns(t *testing.T) {
 	assert.Equal(t, "/foo/bar1", getDirHelper(t, s2))
 }
 
+func TestImageBlobInvalid(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	dgst := digest.FromBytes([]byte("foo"))
+
+	s := ImageBlob("myuser/myrepo:foo@" + string(dgst))
+	_, err := s.Marshal(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "tagged image reference not allowed")
+
+	s = ImageBlob("myuser/myrepo")
+	_, err = s.Marshal(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "checksum required in blob reference")
+
+	s = ImageBlob("myuser/myrepo@sha256:invalid")
+	_, err = s.Marshal(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid reference format")
+}
+
+func TestImageBlobSource(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	blobDgst := digest.FromBytes([]byte("foo"))
+
+	s := ImageBlob("myuser/myrepo@" + string(blobDgst))
+	def, err := s.Marshal(ctx)
+	require.NoError(t, err)
+
+	m, arr := parseDef(t, def.Def)
+	_ = m
+	require.Equal(t, 2, len(arr))
+
+	dgst, idx := last(t, arr)
+	require.Equal(t, 0, idx)
+
+	vtx, ok := m[dgst]
+	require.Equal(t, true, ok)
+
+	src, ok := vtx.Op.(*pb.Op_Source)
+	require.Equal(t, true, ok)
+	require.Nil(t, vtx.Platform)
+
+	require.Equal(t, "docker-image+blob://docker.io/myuser/myrepo@"+string(blobDgst), src.Source.Identifier)
+}
+
+func TestOCILayoutBlobSource(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	blobDgst := digest.FromBytes([]byte("foo"))
+
+	s := OCILayoutBlob("myrepo/blob@"+string(blobDgst), ImageBlobOCIStore("sid", "store0"))
+	def, err := s.Marshal(ctx)
+	require.NoError(t, err)
+
+	m, arr := parseDef(t, def.Def)
+	_ = m
+	require.Equal(t, 2, len(arr))
+
+	dgst, idx := last(t, arr)
+	require.Equal(t, 0, idx)
+
+	vtx, ok := m[dgst]
+	require.Equal(t, true, ok)
+
+	src, ok := vtx.Op.(*pb.Op_Source)
+	require.Equal(t, true, ok)
+	require.Nil(t, vtx.Platform)
+
+	require.Equal(t, "oci-layout+blob://docker.io/myrepo/blob@"+string(blobDgst), src.Source.Identifier)
+	require.Equal(t, "sid", src.Source.Attrs[pb.AttrOCILayoutSessionID])
+	require.Equal(t, "store0", src.Source.Attrs[pb.AttrOCILayoutStoreID])
+}
+
 func TestStateSourceMapMarshal(t *testing.T) {
 	t.Parallel()
 
@@ -63,12 +140,12 @@ func TestStateSourceMapMarshal(t *testing.T) {
 
 	s := Image(
 		"myimage",
-		sm1.Location([]*pb.Range{{Start: pb.Position{Line: 7}}}),
-		sm2.Location([]*pb.Range{{Start: pb.Position{Line: 8}}}),
-		sm1.Location([]*pb.Range{{Start: pb.Position{Line: 9}}}),
+		sm1.Location([]*pb.Range{{Start: &pb.Position{Line: 7}}}),
+		sm2.Location([]*pb.Range{{Start: &pb.Position{Line: 8}}}),
+		sm1.Location([]*pb.Range{{Start: &pb.Position{Line: 9}}}),
 	)
 
-	def, err := s.Marshal(context.TODO())
+	def, err := s.Marshal(t.Context())
 	require.NoError(t, err)
 
 	require.Equal(t, 2, len(def.Def))
@@ -103,9 +180,9 @@ func TestStateSourceMapMarshal(t *testing.T) {
 	require.Equal(t, int32(9), def.Source.Locations[dgst.String()].Locations[2].Ranges[0].Start.Line)
 
 	s = Merge([]State{s, Image("myimage",
-		sm1.Location([]*pb.Range{{Start: pb.Position{Line: 10}}}),
+		sm1.Location([]*pb.Range{{Start: &pb.Position{Line: 10}}}),
 	)})
-	def, err = s.Marshal(context.TODO())
+	def, err = s.Marshal(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, 3, len(def.Def))
 	dgst = digest.FromBytes(def.Def[0])
@@ -151,7 +228,7 @@ func TestPlatformFromImage(t *testing.T) {
 
 	dest := Image("destimage").File(Copy(s, "/", "/")).Run(Args([]string{"afterfile"}))
 
-	def, err := dest.Marshal(context.TODO(), LinuxPpc64le)
+	def, err := dest.Marshal(t.Context(), LinuxPpc64le)
 	require.NoError(t, err)
 
 	m, arr := parseDef(t, def.Def)
@@ -225,7 +302,7 @@ func TestPlatformFromImageWithMerge(t *testing.T) {
 
 	dest := Merge([]State{s, s2}).Run(Args([]string{"aftermerge"}))
 
-	def, err := dest.Marshal(context.TODO(), LinuxPpc64le)
+	def, err := dest.Marshal(t.Context(), LinuxPpc64le)
 	require.NoError(t, err)
 
 	m, arr := parseDef(t, def.Def)
@@ -269,7 +346,7 @@ func TestPlatformFromImageWithMerge(t *testing.T) {
 
 func getEnvHelper(t *testing.T, s State, k string) (string, bool) {
 	t.Helper()
-	v, ok, err := s.GetEnv(context.TODO(), k)
+	v, ok, err := s.GetEnv(t.Context(), k)
 	require.NoError(t, err)
 	return v, ok
 }

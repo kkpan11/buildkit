@@ -4,25 +4,25 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"os"
 	"os/user"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/sys"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/defaults"
+	"github.com/containerd/containerd/v2/pkg/sys"
 	"github.com/containerd/platforms"
 	sddaemon "github.com/coreos/go-systemd/v22/daemon"
-	"github.com/docker/docker/pkg/reexec"
 	"github.com/gofrs/flock"
-	"github.com/hashicorp/go-multierror"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/cache/remotecache/azblob"
 	"github.com/moby/buildkit/cache/remotecache/gha"
@@ -36,35 +36,45 @@ import (
 	"github.com/moby/buildkit/executor/oci"
 	"github.com/moby/buildkit/frontend"
 	dockerfile "github.com/moby/buildkit/frontend/dockerfile/builder"
+	dockerfileversion "github.com/moby/buildkit/frontend/dockerfile/version"
 	"github.com/moby/buildkit/frontend/gateway"
 	"github.com/moby/buildkit/frontend/gateway/forwarder"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/appdefaults"
 	"github.com/moby/buildkit/util/archutil"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/cachedigest"
+	"github.com/moby/buildkit/util/db/boltutil"
+	"github.com/moby/buildkit/util/disk"
 	"github.com/moby/buildkit/util/grpcerrors"
+	_ "github.com/moby/buildkit/util/grpcutil/encoding/proto"
 	"github.com/moby/buildkit/util/profiler"
 	"github.com/moby/buildkit/util/resolver"
+	"github.com/moby/buildkit/util/resolver/limited"
 	"github.com/moby/buildkit/util/stack"
 	"github.com/moby/buildkit/util/tracing"
+	_ "github.com/moby/buildkit/util/tracing/childprocess"
 	"github.com/moby/buildkit/util/tracing/detect"
 	_ "github.com/moby/buildkit/util/tracing/detect/jaeger"
-	_ "github.com/moby/buildkit/util/tracing/env"
 	"github.com/moby/buildkit/util/tracing/transform"
 	"github.com/moby/buildkit/version"
 	"github.com/moby/buildkit/worker"
-	"github.com/moby/sys/user/userns"
+	policy "github.com/moby/policy-helpers"
+	"github.com/moby/sys/userns"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"github.com/urfave/cli"
-	"go.etcd.io/bbolt"
+	"github.com/urfave/cli/v3"
+	bolt "go.etcd.io/bbolt"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -74,21 +84,20 @@ import (
 	"google.golang.org/grpc/health"
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 func init() {
 	apicaps.ExportedProduct = "buildkit"
 	stack.SetVersionInfo(version.Version, version.Revision)
 
-	if reexec.Init() {
-		os.Exit(0)
-	}
-
 	// enable in memory recording for buildkitd traces
 	detect.Recorder = detect.NewTraceRecorder()
 }
 
 var propagators = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+
+const telemetryShutdownTimeout = 5 * time.Second
 
 type workerInitializerOpt struct {
 	config         *config.Config
@@ -97,7 +106,7 @@ type workerInitializerOpt struct {
 }
 
 type workerInitializer struct {
-	fn func(c *cli.Context, common workerInitializerOpt) ([]worker.Worker, error)
+	fn func(c *cli.Command, common workerInitializerOpt) ([]worker.Worker, error)
 	// less priority number, more preferred
 	priority int
 }
@@ -109,21 +118,21 @@ var (
 
 func registerWorkerInitializer(wi workerInitializer, flags ...cli.Flag) {
 	workerInitializers = append(workerInitializers, wi)
-	sort.Slice(workerInitializers,
-		func(i, j int) bool {
-			return workerInitializers[i].priority < workerInitializers[j].priority
-		})
+	slices.SortFunc(workerInitializers, func(a, b workerInitializer) int {
+		return a.priority - b.priority
+	})
 	appFlags = append(appFlags, flags...)
 }
 
 func main() {
-	cli.VersionPrinter = func(c *cli.Context) {
-		fmt.Println(c.App.Name, version.Package, c.App.Version, version.Revision)
+	cli.VersionPrinter = func(c *cli.Command) {
+		fmt.Println(c.Name, version.Package, c.Version, version.Revision)
 	}
-	app := cli.NewApp()
+	app := &cli.Command{}
 	app.Name = "buildkitd"
 	app.Usage = "build daemon"
 	app.Version = version.Version
+	app.DisableSliceFlagSeparator = true
 
 	defaultConf, err := defaultConf()
 	if err != nil {
@@ -133,12 +142,13 @@ func main() {
 
 	rootlessUsage := "set all the default options to be compatible with rootless containers"
 	if userns.RunningInUserNS() {
-		app.Flags = append(app.Flags, cli.BoolTFlag{
+		app.Flags = append(app.Flags, &cli.BoolFlag{
 			Name:  "rootless",
 			Usage: rootlessUsage + " (default: true)",
+			Value: true,
 		})
 	} else {
-		app.Flags = append(app.Flags, cli.BoolFlag{
+		app.Flags = append(app.Flags, &cli.BoolFlag{
 			Name:  "rootless",
 			Usage: rootlessUsage,
 		})
@@ -157,89 +167,123 @@ func main() {
 	}
 
 	app.Flags = append(app.Flags,
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "config",
 			Usage: "path to config file",
 			Value: defaultConfigPath(),
 		},
-		cli.BoolFlag{
+		&cli.BoolFlag{
 			Name:  "debug",
 			Usage: "enable debug output in logs",
 		},
-		cli.BoolFlag{
-			Name:  "trace",
-			Usage: "enable trace output in logs (highly verbose, could affect performance)",
+		&cli.BoolFlag{
+			Name:   "trace",
+			Usage:  "enable trace output in logs (highly verbose, could affect performance)",
+			Hidden: true,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "root",
 			Usage: "path to state directory",
 			Value: defaultConf.Root,
 		},
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:  "addr",
 			Usage: "listening address (socket or tcp)",
-			Value: &cli.StringSlice{defaultConf.GRPC.Address[0]},
+			Value: []string{defaultConf.GRPC.Address[0]},
 		},
 		// Add format flag to control log formatter
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "log-format",
 			Usage: "log formatter: json or text",
 			Value: "text",
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
+			Name:    "log-level",
+			Usage:   "set the log level",
+			Value:   "info",
+			Sources: cli.EnvVars("BUILDKITD_LOG_LEVEL"),
+		},
+		&cli.StringFlag{
 			Name:  "group",
 			Usage: groupUsageStr,
 			Value: groupValue(defaultConf.GRPC.GID),
 		},
-		cli.StringFlag{
-			Name:  "debugaddr",
-			Usage: "debugging address (eg. 0.0.0.0:6060)",
-			Value: defaultConf.GRPC.DebugAddress,
+		&cli.StringFlag{
+			Name:    "debugaddr",
+			Usage:   "debugging address (eg. 0.0.0.0:6060)",
+			Value:   defaultConf.GRPC.DebugAddress,
+			Sources: cli.EnvVars("BUILDKITD_DEBUGADDR"),
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "tlscert",
 			Usage: "certificate file to use",
 			Value: defaultConf.GRPC.TLS.Cert,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "tlskey",
 			Usage: "key file to use",
 			Value: defaultConf.GRPC.TLS.Key,
 		},
-		cli.StringFlag{
+		&cli.StringFlag{
 			Name:  "tlscacert",
 			Usage: "ca certificate to verify clients",
 			Value: defaultConf.GRPC.TLS.CA,
 		},
-		cli.StringSliceFlag{
+		&cli.StringSliceFlag{
 			Name:  "allow-insecure-entitlement",
-			Usage: "allows insecure entitlements e.g. network.host, security.insecure",
+			Usage: "allows insecure entitlements e.g. network.host, security.insecure, device",
 		},
-		cli.StringFlag{
+		&cli.BoolFlag{
+			Name:  "proxy-network",
+			Usage: "enable proxy network enforcement for all builds",
+		},
+		&cli.StringFlag{
 			Name:  "otel-socket-path",
 			Usage: "OTEL collector trace socket path",
+		},
+		&cli.BoolFlag{
+			Name:  "cdi-disabled",
+			Usage: "disables support of the Container Device Interface (CDI)",
+		},
+		&cli.StringSliceFlag{
+			Name:  "cdi-spec-dir",
+			Usage: "list of directories to scan for CDI spec files",
+		},
+		&cli.BoolFlag{
+			Name:  "save-cache-debug",
+			Usage: "enable saving cache debug info",
 		},
 	)
 	app.Flags = append(app.Flags, appFlags...)
 	app.Flags = append(app.Flags, serviceFlags()...)
 
 	var closers []func(ctx context.Context) error
-	app.Action = func(c *cli.Context) error {
+	app.Action = func(_ context.Context, c *cli.Command) error {
 		// TODO: On Windows this always returns -1. The actual "are you admin" check is very Windows-specific.
 		// See https://github.com/golang/go/issues/28804#issuecomment-505326268 for the "short" version.
 		if os.Geteuid() > 0 {
 			return errors.New("rootless mode requires to be executed as the mapped root in a user namespace; you may use RootlessKit for setting up the namespace")
 		}
 		ctx, cancel := context.WithCancelCause(appcontext.Context())
-		defer cancel(errors.WithStack(context.Canceled))
+		defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
-		cfg, err := config.LoadFile(c.GlobalString("config"))
+		cfg, err := config.LoadFile(c.String("config"))
 		if err != nil {
 			return err
 		}
 
+		// Keep track of any warnings we need to print to the log and wait until after
+		// the logger is configured before we write them to the log file.
+		var warnings []string
+		if cfg.Debug { //nolint:staticcheck
+			warnings = append(warnings, "'debug' configuration option is deprecated, use 'log.level = \"debug\"' instead")
+		}
+		if cfg.Trace { //nolint:staticcheck
+			warnings = append(warnings, "'trace' configuration option is deprecated, use 'log.level = \"trace\"' instead")
+		}
+
 		setDefaultConfig(&cfg)
-		if err := applyMainFlags(c, &cfg); err != nil {
+		if err := applyMainFlags(c, &cfg, &warnings); err != nil {
 			return err
 		}
 
@@ -253,16 +297,36 @@ func main() {
 			return errors.Errorf("unsupported log type %q", logFormat)
 		}
 
-		if cfg.Debug {
+		if cfg.Debug { //nolint:staticcheck
 			logrus.SetLevel(logrus.DebugLevel)
 		}
-		if cfg.Trace {
+		if cfg.Trace { //nolint:staticcheck
 			logrus.SetLevel(logrus.TraceLevel)
+		}
+
+		if cfg.Log.Level != "" {
+			level, err := logrus.ParseLevel(cfg.Log.Level)
+			if err != nil {
+				return errors.Wrap(err, "unsupported log level")
+			}
+			logrus.SetLevel(level)
+		}
+
+		if logrus.IsLevelEnabled(logrus.WarnLevel) {
+			for _, w := range warnings {
+				bklog.G(ctx).Warn(w)
+			}
 		}
 
 		if sc := cfg.System; sc != nil {
 			if v := sc.PlatformsCacheMaxAge; v != nil {
 				archutil.CacheMaxAge = v.Duration
+			}
+			if v := sc.MaxRegistryConcurrency; v != nil {
+				if *v <= 0 {
+					return errors.Errorf("maxRegistryConcurrency must be greater than zero; set to %d in the configuration file", *v)
+				}
+				limited.SetMaxConcurrency(int64(*v))
 			}
 		}
 
@@ -339,7 +403,16 @@ func main() {
 			return err
 		}
 
-		controller, err := newController(c, &cfg)
+		if c.Bool("save-cache-debug") {
+			db, err := cachedigest.NewDB(filepath.Join(cfg.Root, "cache-debug.db"))
+			if err != nil {
+				return errors.Wrap(err, "failed to create cache debug db")
+			}
+			cachedigest.SetDefaultDB(db)
+			defer db.Close()
+		}
+
+		controller, err := newController(ctx, c, &cfg, mp)
 		if err != nil {
 			return err
 		}
@@ -349,7 +422,7 @@ func main() {
 		controller.Register(server)
 		reflection.Register(server)
 
-		ents := c.GlobalStringSlice("allow-insecure-entitlement")
+		ents := c.StringSlice("allow-insecure-entitlement")
 		if len(ents) > 0 {
 			cfg.Entitlements = []string{}
 			for _, e := range ents {
@@ -357,6 +430,8 @@ func main() {
 				case "security.insecure":
 					cfg.Entitlements = append(cfg.Entitlements, e)
 				case "network.host":
+					cfg.Entitlements = append(cfg.Entitlements, e)
+				case "device":
 					cfg.Entitlements = append(cfg.Entitlements, e)
 				default:
 					return errors.Errorf("invalid entitlement : %s", e)
@@ -392,18 +467,25 @@ func main() {
 		return err
 	}
 
-	app.After = func(_ *cli.Context) (err error) {
+	app.After = func(_ context.Context, _ *cli.Command) (err error) {
+		ctx, cancel := context.WithTimeoutCause(appcontext.Shutdown(), telemetryShutdownTimeout, errors.WithStack(context.DeadlineExceeded))
+		defer cancel()
+
+		var errs []error
 		for _, c := range closers {
-			if e := c(context.TODO()); e != nil {
-				err = multierror.Append(err, e)
+			if e := c(ctx); e != nil {
+				errs = append(errs, e)
+			}
+			if context.Cause(ctx) != nil {
+				break
 			}
 		}
-		return err
+		return stderrors.Join(errs...)
 	}
 
 	profiler.Attach(app)
 
-	if err := app.Run(os.Args); err != nil {
+	if err := app.Run(context.Background(), os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "buildkitd: %+v\n", err)
 		os.Exit(1)
 	}
@@ -429,7 +511,7 @@ func newGRPCListeners(cfg config.GRPCConfig) ([]net.Listener, error) {
 
 	listeners := make([]net.Listener, 0, len(addrs))
 	for _, addr := range addrs {
-		l, err := getListener(addr, *cfg.UID, *cfg.GID, sd, tlsConfig)
+		l, err := getListener(addr, *cfg.UID, *cfg.GID, sd, tlsConfig, true)
 		if err != nil {
 			for _, l := range listeners {
 				l.Close()
@@ -540,40 +622,47 @@ func setDefaultConfig(cfg *config.Config) {
 	if cfg.OTEL.SocketPath == "" {
 		cfg.OTEL.SocketPath = appdefaults.TraceSocketPath(isRootlessConfig())
 	}
-}
 
-var isRootlessConfigOnce sync.Once
-var isRootlessConfigValue bool
+	if len(cfg.CDI.SpecDirs) == 0 {
+		cfg.CDI.SpecDirs = appdefaults.CDISpecDirs
+	}
+}
 
 // isRootlessConfig is true if we should be using the rootless config
 // defaults instead of the normal defaults.
 func isRootlessConfig() bool {
-	isRootlessConfigOnce.Do(func() {
-		if !userns.RunningInUserNS() {
-			// Default value is false so keep it that way.
-			return
-		}
-		// if buildkitd is being executed as the mapped-root (not only EUID==0 but also $USER==root)
-		// in a user namespace, we don't want to load the rootless changes in the
-		// configuration.
-		u := os.Getenv("USER")
-		isRootlessConfigValue = u != "" && u != "root"
-	})
-	return isRootlessConfigValue
+	if !userns.RunningInUserNS() {
+		// Default value is false so keep it that way.
+		return false
+	}
+	// if buildkitd is being executed as the mapped-root (not only EUID==0 but also $USER==root)
+	// in a user namespace, we don't want to load the rootless changes in the
+	// configuration.
+	u := os.Getenv("USER")
+	return u != "" && u != "root"
 }
 
-func applyMainFlags(c *cli.Context, cfg *config.Config) error {
-	if c.IsSet("debug") {
-		cfg.Debug = c.Bool("debug")
+func applyMainFlags(c *cli.Command, cfg *config.Config, warnings *[]string) error {
+	if c.IsSet("debug") && c.Bool("debug") {
+		cfg.Log.Level = "debug"
 	}
 	if c.IsSet("trace") {
-		cfg.Trace = c.Bool("trace")
+		if warnings != nil {
+			*warnings = append(*warnings, "--trace option is deprecated; use --log-level=trace instead")
+		}
+
+		if c.Bool("trace") {
+			cfg.Log.Level = "trace"
+		}
 	}
 	if c.IsSet("root") {
 		cfg.Root = c.String("root")
 	}
 	if c.IsSet("log-format") {
 		cfg.Log.Format = c.String("log-format")
+	}
+	if c.IsSet("log-level") {
+		cfg.Log.Level = c.String("log-level")
 	}
 	if c.IsSet("addr") || len(cfg.GRPC.Address) == 0 {
 		cfg.GRPC.Address = c.StringSlice("addr")
@@ -582,6 +671,9 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 	if c.IsSet("allow-insecure-entitlement") {
 		// override values from config
 		cfg.Entitlements = c.StringSlice("allow-insecure-entitlement")
+	}
+	if c.IsSet("proxy-network") {
+		cfg.ProxyNetwork = c.Bool("proxy-network")
 	}
 
 	if c.IsSet("debugaddr") {
@@ -606,7 +698,7 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 			}
 			cfg.GRPC.SecurityDescriptor = secDescriptor
 		} else {
-			gid, err := groupToGid(group)
+			gid, err := groupToGID(group)
 			if err != nil {
 				return err
 			}
@@ -628,28 +720,31 @@ func applyMainFlags(c *cli.Context, cfg *config.Config) error {
 		cfg.OTEL.SocketPath = c.String("otel-socket-path")
 	}
 
+	if c.IsSet("cdi-disabled") {
+		cdiDisabled := c.Bool("cdi-disabled")
+		cfg.CDI.Disabled = &cdiDisabled
+	}
+	if c.IsSet("cdi-spec-dir") {
+		cfg.CDI.SpecDirs = c.StringSlice("cdi-spec-dir")
+	}
+
 	applyPlatformFlags(c)
 
 	return nil
 }
 
 // Convert a string containing either a group name or a stringified gid into a numeric id)
-func groupToGid(group string) (int, error) {
+func groupToGID(group string) (int, error) {
 	if group == "" {
 		return os.Getgid(), nil
 	}
 
-	var (
-		err error
-		id  int
-	)
-
 	// Try and parse as a number, if the error is ErrSyntax
 	// (i.e. its not a number) then we carry on and try it as a
 	// name.
-	if id, err = strconv.Atoi(group); err == nil {
+	if id, err := strconv.Atoi(group); err == nil {
 		return id, nil
-	} else if err.(*strconv.NumError).Err != strconv.ErrSyntax {
+	} else if !errors.Is(err, strconv.ErrSyntax) {
 		return 0, err
 	}
 
@@ -659,14 +754,10 @@ func groupToGid(group string) (int, error) {
 	}
 	group = ginfo.Gid
 
-	if id, err = strconv.Atoi(group); err != nil {
-		return 0, err
-	}
-
-	return id, nil
+	return strconv.Atoi(group)
 }
 
-func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls.Config) (net.Listener, error) {
+func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls.Config, warnTLS bool) (net.Listener, error) {
 	addrSlice := strings.SplitN(addr, "://", 2)
 	if len(addrSlice) < 2 {
 		return nil, errors.Errorf("address %s does not contain proto, you meant unix://%s ?",
@@ -686,13 +777,16 @@ func getListener(addr string, uid, gid int, secDescriptor string, tlsConfig *tls
 	case "fd":
 		return listenFD(listenAddr, tlsConfig)
 	case "tcp":
-		l, err := net.Listen("tcp", listenAddr)
+		listener := net.ListenConfig{}
+		l, err := listener.Listen(context.TODO(), "tcp", listenAddr)
 		if err != nil {
 			return nil, err
 		}
 
 		if tlsConfig == nil {
-			bklog.L.Warnf("TLS is not enabled for %s. enabling mutual TLS authentication is highly recommended", addr)
+			if warnTLS {
+				bklog.L.Warnf("TLS is not enabled for %s. enabling mutual TLS authentication is highly recommended", addr)
+			}
 			return l, nil
 		}
 		return tls.NewListener(l, tlsConfig), nil
@@ -736,6 +830,7 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	}
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{certificate},
+		NextProtos:   []string{"h2"},
 	}
 	if caFile != "" {
 		certPool := x509.NewCertPool()
@@ -753,7 +848,7 @@ func serverCredentials(cfg config.TLSConfig) (*tls.Config, error) {
 	return tlsConf, nil
 }
 
-func newController(c *cli.Context, cfg *config.Config) (*control.Controller, error) {
+func newController(ctx context.Context, c *cli.Command, cfg *config.Config, mp metric.MeterProvider) (*control.Controller, error) {
 	sessionManager, err := session.NewManager()
 	if err != nil {
 		return nil, err
@@ -803,8 +898,11 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 	if err != nil {
 		return nil, err
 	}
+	cacheStoreForDebug = cacheStorage
 
-	historyDB, err := bbolt.Open(filepath.Join(cfg.Root, "history.db"), 0600, nil)
+	historyDB, err := boltutil.SafeOpen(filepath.Join(cfg.Root, "history.db"), 0600, &bolt.Options{
+		FreelistType: bolt.FreelistMapType,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -816,21 +914,36 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		return nil, err
 	}
 
+	var verifierProvider func() (*policy.Verifier, error)
+	if cfg.Cache.GHA != nil && cfg.Cache.GHA.Verify.Required {
+		verifierProvider = newVerifierProvider(cfg.Root)
+	}
+
 	remoteCacheExporterFuncs := map[string]remotecache.ResolveCacheExporterFunc{
 		"registry": registryremotecache.ResolveCacheExporterFunc(sessionManager, resolverFn),
 		"local":    localremotecache.ResolveCacheExporterFunc(sessionManager),
 		"inline":   inlineremotecache.ResolveCacheExporterFunc(),
-		"gha":      gha.ResolveCacheExporterFunc(),
+		"gha":      gha.ResolveCacheExporterFunc(cfg.Cache.GHA, verifierProvider),
 		"s3":       s3remotecache.ResolveCacheExporterFunc(),
 		"azblob":   azblob.ResolveCacheExporterFunc(),
 	}
 	remoteCacheImporterFuncs := map[string]remotecache.ResolveCacheImporterFunc{
 		"registry": registryremotecache.ResolveCacheImporterFunc(sessionManager, w.ContentStore(), resolverFn),
 		"local":    localremotecache.ResolveCacheImporterFunc(sessionManager),
-		"gha":      gha.ResolveCacheImporterFunc(),
+		"gha":      gha.ResolveCacheImporterFunc(cfg.Cache.GHA, verifierProvider),
 		"s3":       s3remotecache.ResolveCacheImporterFunc(),
 		"azblob":   azblob.ResolveCacheImporterFunc(),
 	}
+
+	if cfg.CDI.Disabled == nil || !*cfg.CDI.Disabled {
+		cfg.Entitlements = append(cfg.Entitlements, "device")
+	}
+
+	provenanceEnv, err := loadProvenanceEnv(cfg.ProvenanceEnvDir)
+	if err != nil {
+		return nil, err
+	}
+
 	return control.NewController(control.Opt{
 		SessionManager:            sessionManager,
 		WorkerController:          wc,
@@ -840,11 +953,16 @@ func newController(c *cli.Context, cfg *config.Config) (*control.Controller, err
 		CacheManager:              solver.NewCacheManager(context.TODO(), "local", cacheStorage, worker.NewCacheResultStorage(wc)),
 		Entitlements:              cfg.Entitlements,
 		TraceCollector:            tc,
+		MeterProvider:             mp,
 		HistoryDB:                 historyDB,
 		CacheStore:                cacheStorage,
 		LeaseManager:              w.LeaseManager(),
 		ContentStore:              w.ContentStore(),
 		HistoryConfig:             cfg.History,
+		ProxyNetwork:              cfg.ProxyNetwork,
+		GarbageCollect:            w.GarbageCollect,
+		GracefulStop:              ctx.Done(),
+		ProvenanceEnv:             provenanceEnv,
 	})
 }
 
@@ -852,7 +970,7 @@ func resolverFunc(cfg *config.Config) docker.RegistryHosts {
 	return resolver.NewRegistryConfig(cfg.Registries)
 }
 
-func newWorkerController(c *cli.Context, wiOpt workerInitializerOpt) (*worker.Controller, error) {
+func newWorkerController(c *cli.Command, wiOpt workerInitializerOpt) (*worker.Controller, error) {
 	wc := &worker.Controller{}
 	nWorkers := 0
 	for _, wi := range workerInitializers {
@@ -918,27 +1036,38 @@ func getGCPolicy(cfg config.GCConfig, root string) []client.PruneInfo {
 	if cfg.GC != nil && !*cfg.GC {
 		return nil
 	}
+	dstat, _ := disk.GetDiskStat(root)
 	if len(cfg.GCPolicy) == 0 {
-		cfg.GCPolicy = config.DefaultGCPolicy(cfg.GCKeepStorage)
+		cfg.GCPolicy = config.DefaultGCPolicy(cfg, dstat)
 	}
 	out := make([]client.PruneInfo, 0, len(cfg.GCPolicy))
 	for _, rule := range cfg.GCPolicy {
+		//nolint:staticcheck
+		if rule.ReservedSpace == (config.DiskSpace{}) && rule.KeepBytes != (config.DiskSpace{}) {
+			rule.ReservedSpace = rule.KeepBytes
+		}
 		out = append(out, client.PruneInfo{
-			Filter:       rule.Filters,
-			All:          rule.All,
-			KeepBytes:    rule.KeepBytes.AsBytes(root),
-			KeepDuration: rule.KeepDuration.Duration,
+			Filter:        rule.Filters,
+			All:           rule.All,
+			KeepDuration:  rule.KeepDuration.Duration,
+			ReservedSpace: rule.ReservedSpace.AsBytes(dstat),
+			MaxUsedSpace:  rule.MaxUsedSpace.AsBytes(dstat),
+			MinFreeSpace:  rule.MinFreeSpace.AsBytes(dstat),
 		})
 	}
 	return out
 }
 
 func getBuildkitVersion() client.BuildkitVersion {
-	return client.BuildkitVersion{
+	buildkitVersion := client.BuildkitVersion{
 		Package:  version.Package,
 		Version:  version.Version,
 		Revision: version.Revision,
 	}
+	if dockerfileVersion := dockerfileversion.Version(); dockerfileVersion != "" {
+		buildkitVersion.DockerfileVersion = dockerfileVersion
+	}
+	return buildkitVersion
 }
 
 func getDNSConfig(cfg *config.DNSConfig) *oci.DNSConfig {
@@ -1002,6 +1131,7 @@ func newTracerProvider(ctx context.Context) (*sdktrace.TracerProvider, error) {
 func newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithResource(detect.Resource()),
+		sdkmetric.WithView(buildDurationView()),
 	}
 
 	if r, err := prometheus.New(); err != nil {
@@ -1020,4 +1150,79 @@ func newMeterProvider(ctx context.Context) (*sdkmetric.MeterProvider, error) {
 		opts = append(opts, sdkmetric.WithReader(r))
 	}
 	return sdkmetric.NewMeterProvider(opts...), nil
+}
+
+// buildDurationView routes the buildkit.build.duration histogram to a
+// Base2 exponential aggregation so that the OTEL Prometheus exporter
+// renders it as a Prometheus native histogram. Native histograms avoid
+// the "tens of millions of series" cardinality blow-up reported in
+// moby/buildkit#5777 by storing observations in dynamically-sized
+// exponential buckets rather than a fixed bucket schedule.
+//
+// The AttributeFilter is defense in depth: only the status attribute
+// is recorded on this histogram, regardless of what the call site
+// supplies.
+func buildDurationView() sdkmetric.View {
+	return sdkmetric.NewView(
+		sdkmetric.Instrument{
+			Name: "buildkit.build.duration",
+			Kind: sdkmetric.InstrumentKindHistogram,
+		},
+		sdkmetric.Stream{
+			Aggregation: sdkmetric.AggregationBase2ExponentialHistogram{
+				MaxSize:  160,
+				MaxScale: 20,
+			},
+			AttributeFilter: attribute.NewAllowKeysFilter("status"),
+		},
+	)
+}
+
+func getCDIManager(cfg config.CDIConfig) (*cdidevices.Manager, error) {
+	if cfg.Disabled != nil && *cfg.Disabled {
+		return nil, nil
+	}
+	if len(cfg.SpecDirs) == 0 {
+		return nil, errors.New("no CDI specification directories specified")
+	}
+	cdiCache, err := func() (*cdi.Cache, error) {
+		cdiCache, err := cdi.NewCache(cdi.WithSpecDirs(cfg.SpecDirs...))
+		if err != nil {
+			return nil, err
+		}
+		if err := cdiCache.Refresh(); err != nil {
+			return nil, err
+		}
+		if errs := cdiCache.GetErrors(); len(errs) > 0 {
+			for dir, errs := range errs {
+				for _, err := range errs {
+					bklog.L.Warnf("CDI setup error %v: %+v", dir, err)
+				}
+			}
+		}
+		return cdiCache, nil
+	}()
+	if err != nil {
+		return nil, errors.Wrapf(err, "CDI registry initialization failure")
+	}
+	return cdidevices.NewManager(cdiCache, cfg.AutoAllowed), nil
+}
+
+func newVerifierProvider(root string) func() (*policy.Verifier, error) {
+	var mu sync.Mutex
+	var verifier *policy.Verifier
+	var initErr error
+	return func() (*policy.Verifier, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if verifier != nil || initErr != nil {
+			return verifier, initErr
+		}
+		statePath := filepath.Join(root, "policy")
+		verifier, initErr = policy.NewVerifier(policy.Config{
+			StateDir:      statePath,
+			RequireOnline: false,
+		})
+		return verifier, initErr
+	}
 }

@@ -1,7 +1,6 @@
 package oci
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path"
@@ -103,29 +102,33 @@ func TestResolvConf(t *testing.T) {
 	}
 
 	for _, tt := range cases {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx := t.Context()
 			tempDir := t.TempDir()
 			oldResolvconfPath := resolvconfPath
 			t.Cleanup(func() {
 				resolvconfPath = oldResolvconfPath
 			})
-			resolvconfPath = func() string {
-				if tt.dt == nil {
-					return "no-such-file"
+			for i := range tt.execution {
+				resolvconfPath = func(netMode pb.NetMode) string {
+					if tt.dt == nil {
+						return "no-such-file"
+					}
+					rpath := path.Join(t.TempDir(), "resolv.conf")
+					require.NoError(t, os.WriteFile(rpath, tt.dt, 0600))
+					require.Equal(t, tt.networkMode[i], netMode)
+					return rpath
 				}
-				rpath := path.Join(t.TempDir(), "resolv.conf")
-				require.NoError(t, os.WriteFile(rpath, tt.dt, 0600))
-				return rpath
-			}
-			for i := 0; i < tt.execution; i++ {
 				if i > 0 {
 					time.Sleep(100 * time.Millisecond)
 				}
-				p, err := GetResolvConf(ctx, tempDir, nil, nil, tt.networkMode[i])
+				root, err := os.OpenRoot(tempDir)
 				require.NoError(t, err)
-				b, err := os.ReadFile(p)
+				defer root.Close()
+
+				p, err := GetResolvConf(ctx, root, nil, nil, tt.networkMode[i])
+				require.NoError(t, err)
+				b, err := root.ReadFile(p)
 				require.NoError(t, err)
 				require.Equal(t, tt.expected[i], string(b))
 			}

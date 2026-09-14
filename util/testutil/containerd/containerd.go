@@ -1,11 +1,10 @@
 package containerd
 
 import (
-	"context"
 	"testing"
 	"time"
 
-	containerdpkg "github.com/containerd/containerd"
+	containerdpkg "github.com/containerd/containerd/v2/client"
 )
 
 func GetVersion(t *testing.T, cdAddress string) string {
@@ -16,7 +15,7 @@ func GetVersion(t *testing.T, cdAddress string) string {
 		t.Fatal(err)
 	}
 	defer cdClient.Close()
-	ctx := context.TODO()
+	ctx := t.Context()
 	cdVersion, err := cdClient.Version(ctx)
 	if err != nil {
 		t.Fatal(err)

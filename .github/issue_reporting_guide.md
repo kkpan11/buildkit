@@ -1,17 +1,17 @@
 # Issue reporting guide
 
-* [Security issues](#security-issues)
-* [Search for an existing issue](#search-for-an-existing-issue)
-* [Reproducible test case](#reproducible-test-case)
-* [Describe your environment](#describe-your-environment)
-* [Reporting deadlock](#reporting-deadlock)
-* [Reporting panics/error returns](#reporting-panicserror-returns)
-* [Gathering more debugging data](#gathering-more-debugging-data)
-* [Regressions](#regressions)
-* [Debugging issues that only reproduce in the live environment](#debugging-issues-that-only-reproduce-in-the-live-environment)
-* [Follow the progress of your issue](#follow-the-progress-of-your-issue)
-* [Try fixing your issue yourself](#try-fixing-your-issue-yourself)
-* [Additional reading](#additional-reading)
+- [Security issues](#security-issues)
+- [Search for an existing issue](#search-for-an-existing-issue)
+- [Reproducible test case](#reproducible-test-case)
+- [Describe your environment](#describe-your-environment)
+- [Reporting deadlock](#reporting-deadlock)
+- [Reporting panics/error returns](#reporting-panicserror-returns)
+- [Gathering more debugging data](#gathering-more-debugging-data)
+- [Regressions](#regressions)
+- [Debugging issues that only reproduce in the live environment](#debugging-issues-that-only-reproduce-in-the-live-environment)
+- [Follow the progress of your issue](#follow-the-progress-of-your-issue)
+- [Try fixing your issue yourself](#try-fixing-your-issue-yourself)
+- [Additional reading](#additional-reading)
 
 ## Security issues
 
@@ -57,7 +57,7 @@ Sometimes it is not completely clear if the issue belongs in `moby/buildkit` , `
 
 Provide versions of the tools you used:
 
-- Using Buildkitd/Buildctl  `buildctl --version` `buildkitd version`
+- Using Buildkitd/Buildctl  `buildctl --version` and `buildkitd version`
 - Using Docker Buildx `docker buildx version` and `docker buildx inspect` to return info about your current builder instance. If you run `docker build` then also report this.
 - If the issue is specific to Docker Engine embedded BuildKit or `docker buildx` Docker driver then report `docker version` and `docker info`
 
@@ -74,7 +74,7 @@ docker buildx inspect
 If you also want to check if the issue still appears in the `master` development branch you can run:
 
 ```bash
-docker buildx build --load -t moby/buildkit:dev "https://github.com/moby/buildkit.git"
+docker buildx build --load -t moby/buildkit:dev "https://github.com/moby/buildkit.git" --build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
 docker buildx create --name buildkit-dev --driver-opt image=moby/buildkit:dev --bootstrap
 export BUILDX_BUILDER=buildkit-dev
 docker buildx inspect
@@ -83,7 +83,7 @@ docker buildx inspect
 To check if a specific existing PR is fixing the problem you can replace the first line with:
 
 ```bash
-docker buildx build --load -t moby/buildkit:dev "https://github.com/moby/buildkit.git#pull/NR/head"
+docker buildx build --load -t moby/buildkit:dev "https://github.com/moby/buildkit.git#pull/NR/head" --build-arg BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
 ```
 
 If your issue requires a specific environment or you have only encountered it in a specific environment then make sure to describe that.
